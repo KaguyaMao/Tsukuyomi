@@ -1,0 +1,42 @@
+{
+  "name": "tsukuyomi",
+  "version": "0.6.0",
+  "description": "Tsukuyomi (formerly KaguyaPi) — a Grok Build-style agent TUI with OpenCode-style workspace panels and multi-provider sign-in, powered by the Pi coding-agent kernel.",
+  "type": "module",
+  "bin": {
+    "tsukuyomi": "bin/tsukuyomi.mjs",
+    "kaguyapi": "bin/kaguyapi.mjs"
+  },
+  "files": [
+    "app/",
+    "bin/",
+    "src/",
+    "docs/",
+    "LICENSE",
+    "README.md",
+    "package.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/backend.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check bin/tsukuyomi.mjs && node --check bin/kaguyapi.mjs && for file in app/*.mjs app/providers/*.mjs app/providers/config/*.mjs; do node --check \"$file\" || exit $?; done",
+    "package:npm": "npm pack --ignore-scripts",
+    "package:all": "bash packaging/build-packages.sh"
+  },
+  "dependencies": {
+    "node-pty": "1.1.0",
+    "@xterm/headless": "5.5.0",
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "typebox": "1.1.24"
+  }
+}

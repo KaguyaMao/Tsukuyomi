@@ -1,0 +1,16 @@
+# dependencies
+node_modules/
+
+# bundled PI runtime (packaging only)
+runtime/
+
+# local build output and logs
+build/
+dist/
+logs/
+*.log
+perf.log
+
+# editor / OS
+.DS_Store
+*.swp
