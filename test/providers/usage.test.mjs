@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProviderUsageClient, quotaAdapters } from "../../app/providers/usage.mjs";
+import { ProviderUsageClient, quotaAdapters, parseXaiSubscriptions } from "../../app/providers/usage.mjs";
 import { writeStoredCredential } from "../../app/providers/store.mjs";
 
 function agentDirWith(providerId, credential) {
@@ -82,17 +82,20 @@ test("anthropic never sends the OAuth token to a different host", async () => {
 });
 
 test("xAI reports no public quota endpoint with the right page per credential type", async () => {
-	const oauthDir = agentDirWith("xai", { type: "oauth", access: "a", refresh: "r", expires: 9e12 });
-	const subscription = await client(oauthDir, async () => { throw new Error("must not fetch"); })
-		.get({ provider: "xai", baseUrl: "https://api.x.ai/v1" });
-	assert.equal(subscription.code, "no-endpoint");
-	assert.equal(subscription.pageUrl, "https://grok.com/settings/usage");
-
+	// API-key accounts have no consumer subscription and no quota endpoint.
 	const keyDir = agentDirWith("xai", { type: "api_key", key: "xai-key" });
 	const apiKey = await client(keyDir, async () => { throw new Error("must not fetch"); })
 		.get({ provider: "xai", baseUrl: "https://api.x.ai/v1" });
 	assert.equal(apiKey.code, "no-endpoint");
 	assert.equal(apiKey.pageUrl, "https://console.x.ai/usage");
+
+	// OAuth accounts can read the plan; when there is no subscription the pool
+	// is only shown in the web UI.
+	const oauthDir = agentDirWith("xai", { type: "oauth", access: "a", refresh: "r", expires: 9e12 });
+	const empty = await client(oauthDir, async () => jsonResponse({ subscriptions: [] }))
+		.get({ provider: "xai", baseUrl: "https://api.x.ai/v1" });
+	assert.equal(empty.code, "no-endpoint");
+	assert.equal(empty.pageUrl, "https://grok.com/settings/usage");
 });
 
 test("openrouter and deepseek parse their payloads", async () => {
@@ -170,5 +173,63 @@ test("adapters declare their supported credential types", () => {
 	assert.deepEqual(quotaAdapters.openrouter.credentialTypes, ["api_key"]);
 	assert.equal(ProviderUsageClient.supports("anthropic", "oauth"), true);
 	assert.equal(ProviderUsageClient.supports("anthropic", "api_key"), false);
+	assert.equal(ProviderUsageClient.supports("xai", "oauth"), true);
 	assert.equal(ProviderUsageClient.supports("xai", "api_key"), false);
+});
+
+test("parseXaiSubscriptions prefers an active subscription", () => {
+	const payload = {
+		subscriptions: [
+			{ tier: "SUBSCRIPTION_TIER_GROK_PRO", status: "SUBSCRIPTION_STATUS_INACTIVE", billingPeriodEnd: "2026-07-22T11:40:57Z" },
+			{ tier: "SUBSCRIPTION_TIER_GROK_PRO", status: "SUBSCRIPTION_STATUS_ACTIVE", billingPeriodEnd: "2026-10-22T11:40:57Z" },
+		],
+	};
+	const plan = parseXaiSubscriptions(payload);
+	assert.equal(plan.tier, "grok pro");
+	assert.equal(plan.status, "active");
+	assert.equal(plan.periodEnd, Date.parse("2026-10-22T11:40:57Z"));
+});
+
+test("parseXaiSubscriptions falls back to the first entry and handles empty payloads", () => {
+	assert.equal(parseXaiSubscriptions({ subscriptions: [{ tier: "SUBSCRIPTION_TIER_GROK_PRO", status: "SUBSCRIPTION_STATUS_INACTIVE" }] }).status, "inactive");
+	assert.equal(parseXaiSubscriptions({}), undefined);
+	assert.equal(parseXaiSubscriptions(null), undefined);
+	assert.equal(parseXaiSubscriptions({ subscriptions: [] }), undefined);
+});
+
+test("xAI OAuth reads the subscription plan from grok.com", async () => {
+	const dir = agentDirWith("xai", { type: "oauth", access: "xai-oauth-token", refresh: "r", expires: 9e12 });
+	const calls = [];
+	const usage = await client(dir, async (url, init) => {
+		calls.push({ url, init });
+		return jsonResponse({
+			subscriptions: [{ tier: "SUBSCRIPTION_TIER_GROK_PRO", status: "SUBSCRIPTION_STATUS_ACTIVE", billingPeriodEnd: "2026-10-22T11:40:57Z" }],
+		});
+	}).get({ provider: "xai", id: "grok-4", baseUrl: "https://api.x.ai/v1" });
+
+	assert.equal(calls[0].url, "https://grok.com/rest/subscriptions");
+	assert.equal(calls[0].init.headers.Authorization, "Bearer xai-oauth-token");
+	assert.equal(usage.kind, "available");
+	assert.equal(usage.plan.tier, "grok pro");
+	assert.equal(usage.plan.status, "active");
+	assert.equal(usage.note, "xai-usage-pool-web-only");
+	assert.equal(usage.pageUrl, "https://grok.com/settings/usage");
+	assert.equal(usage.windows.length, 0);
+});
+
+test("xAI OAuth treats a 403 as expired login", async () => {
+	const dir = agentDirWith("xai", { type: "oauth", access: "xai-oauth-token", refresh: "r", expires: 9e12 });
+	const result = await client(dir, async () => new Response("{}", { status: 403 })).get({ provider: "xai", baseUrl: "https://api.x.ai/v1" });
+	assert.equal(result.kind, "unsupported");
+	assert.equal(result.code, "expired-auth");
+	assert.equal(result.pageUrl, "https://grok.com/settings/usage");
+});
+
+test("xAI API-key accounts have no quota endpoint", async () => {
+	const dir = agentDirWith("xai", { type: "api_key", key: "xai-api-key" });
+	const result = await client(dir, async () => { throw new Error("must not fetch"); })
+		.get({ provider: "xai", baseUrl: "https://api.x.ai/v1" });
+	assert.equal(result.kind, "unsupported");
+	assert.equal(result.code, "no-endpoint");
+	assert.equal(result.pageUrl, "https://console.x.ai/usage");
 });

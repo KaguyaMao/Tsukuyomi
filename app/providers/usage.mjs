@@ -208,15 +208,18 @@ export const quotaAdapters = {
 	},
 
 	/**
-	 * xAI/Grok has no public quota or balance endpoint. Usage is visible in the
-	 * console (API keys) or in Settings -> Usage (subscription weekly pool), and
-	 * rate limits are only returned as `x-ratelimit-*` headers on model calls.
+	 * xAI/Grok. The consumer subscription plan is readable with the device-code
+	 * OAuth token (`GET https://grok.com/rest/subscriptions`). The weekly usage
+	 * pool and rate limits are NOT exposed to OAuth2 tokens: the
+	 * `/rest/rate-limits` endpoint returns `oauth2-auth-forbidden`, and there is
+	 * no API-key quota endpoint (rate limits live only in `x-ratelimit-*`
+	 * response headers on model calls). So we surface the plan and tell the user
+	 * where the pool actually lives. Handled in `#requestXai`.
 	 */
 	xai: {
 		id: "xai",
-		hosts: ["api.x.ai"],
-		credentialTypes: ["oauth", "api_key"],
-		unsupported: "no-public-quota-endpoint",
+		hosts: ["api.x.ai", "grok.com"],
+		credentialTypes: ["oauth"],
 		pageUrl: (credentialType) =>
 			credentialType === "oauth" ? "https://grok.com/settings/usage" : "https://console.x.ai/usage",
 	},
@@ -230,6 +233,30 @@ function resetAtOf(value, capturedAt) {
 	if (seconds == null) return undefined;
 	// Accept epoch seconds as well as milliseconds.
 	return seconds < 100_000_000_000 ? seconds * 1_000 : seconds;
+}
+
+/**
+ * Parse a `/rest/subscriptions` payload. Prefers an active subscription,
+ * otherwise the first one. Returns a normalized plan or undefined when there
+ * is nothing usable.
+ */
+export function parseXaiSubscriptions(payload) {
+	const subs = Array.isArray(payload?.subscriptions) ? payload.subscriptions : [];
+	if (subs.length === 0) return undefined;
+	const active = subs.find((sub) => sub?.status === "SUBSCRIPTION_STATUS_ACTIVE") || subs[0];
+	const tier = String(active?.tier || "")
+		.replace(/^SUBSCRIPTION_TIER_/, "")
+		.replace(/_/g, " ")
+		.toLowerCase();
+	const status = String(active?.status || "")
+		.replace(/^SUBSCRIPTION_STATUS_/, "")
+		.toLowerCase();
+	const periodEnd = active?.billingPeriodEnd ? Date.parse(active.billingPeriodEnd) : undefined;
+	return {
+		tier: tier || undefined,
+		status: status || undefined,
+		periodEnd: Number.isFinite(periodEnd) ? periodEnd : undefined,
+	};
 }
 
 export class ProviderUsageClient {
@@ -272,6 +299,13 @@ export class ProviderUsageClient {
 					now: this.now,
 					timeoutMs: this.timeoutMs,
 				}));
+		}
+
+		// xAI/Grok: the consumer subscription plan is readable with the OAuth
+		// token, but the weekly usage pool is not (see adapter note).
+		if (provider === "xai") {
+			return this.#cached(model, credential, force, async () =>
+				this.#requestXai({ model, credential, credentialType }));
 		}
 
 		if (!adapter) return { kind: "unsupported", code: "endpoint", provider };
@@ -341,6 +375,75 @@ export class ProviderUsageClient {
 				return { kind: "error", code: "network", provider: adapter.id, reason: error.message };
 			}
 			return { kind: "error", code: "http", provider: adapter.id, reason: error instanceof Error ? error.message : String(error) };
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * xAI/Grok. API-key accounts have no consumer subscription and no quota
+	 * endpoint (rate limits only arrive as `x-ratelimit-*` headers on model
+	 * calls), so they fall back to "no-endpoint". OAuth accounts can read the
+	 * subscription plan from `https://grok.com/rest/subscriptions`; the weekly
+	 * usage pool itself is deliberately forbidden to OAuth2 tokens.
+	 */
+	async #requestXai({ credential, credentialType }) {
+		if (credentialType !== "oauth") {
+			return {
+				kind: "unsupported",
+				code: "no-endpoint",
+				provider: "xai",
+				pageUrl: credentialType === "api_key" ? "https://console.x.ai/usage" : "https://grok.com/settings/usage",
+			};
+		}
+		const token = credential?.access;
+		if (!token) {
+			return { kind: "unsupported", code: "no-auth", provider: "xai", pageUrl: "https://grok.com/settings/usage" };
+		}
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+		try {
+			// grok.com is xAI's own consumer service. The device-code OAuth token
+			// is issued by auth.x.ai for the same account and is accepted here;
+			// we never send it to a third party.
+			const response = await this.fetchImpl("https://grok.com/rest/subscriptions", {
+				method: "GET",
+				headers: {
+					Accept: "application/json",
+					Authorization: `Bearer ${token}`,
+					"User-Agent": "Mozilla/5.0",
+				},
+				signal: controller.signal,
+				redirect: "error",
+			});
+			if (response.status === 401 || response.status === 403) {
+				return { kind: "unsupported", code: "expired-auth", provider: "xai", pageUrl: "https://grok.com/settings/usage" };
+			}
+			if (!response.ok) {
+				return { kind: "error", code: "http", status: response.status, provider: "xai" };
+			}
+			const payload = await response.json().catch(() => null);
+			const plan = parseXaiSubscriptions(payload);
+			if (!plan) {
+				return { kind: "unsupported", code: "no-endpoint", provider: "xai", pageUrl: "https://grok.com/settings/usage" };
+			}
+			return {
+				kind: "available",
+				plan: { tier: plan.tier, status: plan.status, periodEnd: plan.periodEnd },
+				windows: [],
+				pageUrl: "https://grok.com/settings/usage",
+				note: "xai-usage-pool-web-only",
+				provider: "xai",
+				capturedAt: this.now(),
+			};
+		} catch (error) {
+			if (error?.name === "AbortError" || error?.name === "TimeoutError") {
+				return { kind: "error", code: "timeout", provider: "xai" };
+			}
+			if (isNetworkError(error)) {
+				return { kind: "error", code: "network", provider: "xai", reason: error.message };
+			}
+			return { kind: "error", code: "http", provider: "xai", reason: error instanceof Error ? error.message : String(error) };
 		} finally {
 			clearTimeout(timer);
 		}

@@ -970,6 +970,15 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			return lines.join("\n");
 		}
 		if (result.planType) lines.push(`${t("status.plan")}: ${result.planType}`);
+		if (result.plan) {
+			const parts = [result.plan.tier].filter(Boolean);
+			if (result.plan.status) parts.push(result.plan.status);
+			if (parts.length > 0) lines.push(`${t("status.plan")}: ${parts.join(" · ")}`);
+			if (result.plan.periodEnd) {
+				lines.push(`${t("status.planPeriodEnd", { time: formatDateTime(result.plan.periodEnd, locale) })}`);
+			}
+			if (result.note === "xai-usage-pool-web-only") lines.push(t("status.xaiPoolWebOnly"));
+		}
 		if (!result.windows?.length && !result.credits && !result.monthly) {
 			lines.push(t("status.notAvailable"));
 		} else {
