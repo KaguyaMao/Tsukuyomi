@@ -376,14 +376,19 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 | 场景 | 端点 | 处理方式 |
 | --- | --- | --- |
 | OpenAI/Codex 账号登录与令牌刷新 | `auth.openai.com` | 经 curl 走代理 |
+| xAI（SuperGrok / X Premium）登录 | `auth.x.ai/oauth2/*` | 经 curl 走代理 |
 | 账户额度查询（`/status`） | `chatgpt.com/backend-api/wham/usage` | 先直连，失败后经 curl 走代理 |
 | 自定义供应商模型发现 | 任意 `baseURL` | 先直连，失败后经 curl 走代理 |
+| 模型推理（由 PI 内核发起） | 各供应商 API，如 `api.x.ai` | 内核继承代理并启用 `NODE_USE_ENV_PROXY` |
 
 原因：Node 的原生 `fetch`（undici）默认**不读取** `HTTP_PROXY` / `HTTPS_PROXY`（除非用 `--use-env-proxy` 启动，且该选项对旧版 Node 不可用），而 OpenAI 还会拒绝数据中心 IP 的 TLS 指纹返回 `403 unsupported_country_region_territory`。因此：
 
 1. `app/net-env.mjs` 在启动时从 `.env` 读取代理（顺序：`<agent>/.env` → `~/.tsukuyomi` → `~/.kaguyapi` → `~/.pi` → `~/.codex`），并**不覆盖**你已显式导出的变量。
-2. `app/curl-fetch.cjs` 用 `curl -x <proxy>` 处理这些请求（curl 的 TLS 指纹被接受）。钩子默认只匹配**非流式**端点（`auth.openai.com`、`chatgpt.com/backend-api/wham/`），**不会**碰 `…/backend-api/codex/*` 等流式请求，避免破坏逐字输出。
-3. `app/http.mjs` 的 `createProxyAwareFetch()` 保留原生 fetch 为快路径，仅在连接类失败且已配置代理时用 curl 重试。
+2. 若检测到代理且未启用 `NODE_USE_ENV_PROXY`，Tsukuyomi 会**自动重启一次**并带上该变量（`TSUKUYOMI_NET_PROXY_EXEC=1` 防止循环），使所有原生 fetch 都走代理。旧版 Node 忽略该变量，仍由下面的 curl 兜底。
+3. `app/curl-fetch.cjs` 用 `curl -x <proxy>` 处理登录与额度请求（curl 的 TLS 指纹被接受）。默认只匹配**非流式**端点：`auth.openai.com`、`auth.x.ai`、`chatgpt.com/backend-api/wham/`；**不会**碰 `api.x.ai`、`…/backend-api/codex/*` 等流式请求，避免破坏逐字输出。
+4. `app/http.mjs` 的 `createProxyAwareFetch()` 保留原生 fetch 为快路径，仅在连接类失败且已配置代理时用 curl 重试。
+
+> 注意：代理变量只影响登录、额度与发现；模型推理由 PI 内核发起，内核会继承同样的代理设置。若某供应商的 API 主机在你的网络只能走代理，请确认代理进程正常运行。
 
 相关变量：
 
@@ -406,3 +411,13 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 | 登录后仍被判“该地区不支持” | 钩子未生效。检查 `app/curl-fetch.cjs` 是否存在、`NODE_OPTIONS` 是否被注入（启动日志无 “could not install the curl-fetch hook”）。 |
 | 模型输出卡住不动 | 钩子匹配范围被改得太宽，把流式端点也接管了。默认规则不含 `…/backend-api/codex/*`；如自定义了 `TSUKUYOMI_CURL_FETCH_MATCH`，请排除流式路径。 |
 | 自定义供应商“模型发现失败” | 端点或密钥问题；若端点仅代理可达，会自动重试，仍失败则为端点返回异常。 |
+
+## 14. xAI（SuperGrok / X Premium）登录说明
+
+- 在 `/provider` 中选择 **xAI**，会出现两个登录方式：
+  - **Sign in with SuperGrok or X Premium**（OAuth，device code）
+  - **xAI API key**（API Key）
+- 选择 OAuth 后，界面会显示授权网址与一次性 code（例如 `https://accounts.x.ai/oauth2/device?user_code=XXXX-XXXX`），并自动尝试打开浏览器。用 SuperGrok 或 X Premium 账号完成授权即可。
+- 若**完全没有出现登录界面**，通常是登录端点在发起请求前就失败了。此时会显示：
+  「直连与代理都无法访问 xAI 的登录端点。你也可以改用 API Key 登录。」
+  处理：`TSUKUYOMI_CURL_FETCH_DEBUG=1 tsukuyomi` 观察 `auth.x.ai` 是否被 curl 接管；确认代理可用；或直接用 API Key 登录。

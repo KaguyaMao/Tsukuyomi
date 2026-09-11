@@ -11,8 +11,10 @@ import {
 	findCurlFetchHook,
 	installFetchHook,
 	loadEnvFile,
+	needsProxyRestart,
 	networkEnvForChild,
 	parseEnvFile,
+	restartWithProxy,
 	withRequireOption,
 } from "../app/net-env.mjs";
 
@@ -137,4 +139,43 @@ test("applyNetworkEnv never overrides an explicit proxy", () => {
 	const result = applyNetworkEnv({ agentDir, appRoot: home, home, env });
 	assert.equal(env.HTTPS_PROXY, "http://from-shell");
 	assert.equal(result.applied.includes("HTTPS_PROXY"), false);
+});
+
+test("needsProxyRestart only fires when a proxy is set and it is the first pass", () => {
+	assert.equal(needsProxyRestart({}), false);
+	assert.equal(needsProxyRestart({ HTTPS_PROXY: "http://p" }), true);
+	assert.equal(needsProxyRestart({ HTTPS_PROXY: "http://p", NODE_USE_ENV_PROXY: "1" }), false);
+	assert.equal(needsProxyRestart({ HTTPS_PROXY: "http://p", TSUKUYOMI_NET_PROXY_EXEC: "1" }), false);
+});
+
+test("restartWithProxy re-executes with the marker and returns the child status", () => {
+	const calls = [];
+	const previousArgv = process.argv;
+	process.argv = ["node", "/tmp/tsukuyomi.mjs", "--plan"];
+	try {
+		const status = restartWithProxy({
+			env: { HTTPS_PROXY: "http://p" },
+			spawn: (command, args, options) => {
+				calls.push({ command, args, options });
+				return { status: 7 };
+			},
+		});
+		assert.equal(status, 7);
+	} finally {
+		process.argv = previousArgv;
+	}
+	assert.equal(calls.length, 1);
+	assert.deepEqual(calls[0].args, ["/tmp/tsukuyomi.mjs", "--plan"]);
+	assert.equal(calls[0].options.env.NODE_USE_ENV_PROXY, "1");
+	assert.equal(calls[0].options.env.TSUKUYOMI_NET_PROXY_EXEC, "1");
+});
+
+test("restartWithProxy reports failure without crashing the launcher", () => {
+	assert.equal(
+		restartWithProxy({
+			env: { HTTPS_PROXY: "http://p" },
+			spawn: () => ({ error: new Error("spawn failed") }),
+		}),
+		undefined,
+	);
 });

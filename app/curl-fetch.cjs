@@ -33,9 +33,16 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-/** Non-streaming endpoints that need curl (OAuth + account quota). */
+/**
+ * Non-streaming endpoints that need curl (OAuth device-code/token endpoints and
+ * the account-quota endpoint). These hosts are often unreachable directly but
+ * work through the proxy, and OpenAI additionally rejects Node's TLS
+ * fingerprint. Streaming endpoints (api.x.ai, .../backend-api/codex/*, ...) must
+ * never be listed here.
+ */
 const DEFAULT_MATCHES = [
 	"^https://auth\\.openai\\.com($|/)",
+	"^https://auth\\.x\\.ai($|/)",
 	"^https://chatgpt\\.com/backend-api/wham/",
 ];
 

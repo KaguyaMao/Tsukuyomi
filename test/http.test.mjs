@@ -83,14 +83,18 @@ test("loadCurlFetch resolves the vendored helper", () => {
 	assert.equal(typeof loadCurlFetch(), "function");
 });
 
-test("curl-fetch matches only non-streaming endpoints", () => {
+test("curl-fetch matches OAuth and quota hosts but never streaming endpoints", () => {
 	const hook = require("../app/curl-fetch.cjs");
 	assert.equal(typeof hook.curlFetch, "function");
-	// OAuth and the account-quota endpoint need curl.
+	// OAuth device-code/token endpoints and the account-quota endpoint need curl.
 	assert.equal(hook.shouldIntercept("https://auth.openai.com/oauth/token"), true);
+	assert.equal(hook.shouldIntercept("https://auth.x.ai/oauth2/device/code"), true);
+	assert.equal(hook.shouldIntercept("https://auth.x.ai/oauth2/token"), true);
 	assert.equal(hook.shouldIntercept("https://chatgpt.com/backend-api/wham/usage"), true);
-	// Streaming model endpoints must never be routed through curl.
+	// Streaming model endpoints must never be routed through curl: a single
+	// non-chunked body would break incremental output.
 	assert.equal(hook.shouldIntercept("https://chatgpt.com/backend-api/codex/responses"), false);
+	assert.equal(hook.shouldIntercept("https://api.x.ai/v1/responses"), false);
 	assert.equal(hook.shouldIntercept("https://api.anthropic.com/v1/messages"), false);
 	assert.equal(hook.shouldIntercept(undefined), false);
 });

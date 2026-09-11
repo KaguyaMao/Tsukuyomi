@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolvePiTui } from "./pi-runtime.mjs";
 import { createProviderRuntime } from "./providers/runtime.mjs";
 import { runAuthFlow } from "./providers/auth-flow.mjs";
+import { AuthErrorCode } from "./providers/errors.mjs";
 import { loadProviderCatalog } from "./providers/registry.mjs";
 import { openUrl } from "./open-url.mjs";
 import { redactText } from "./redact.mjs";
@@ -1373,7 +1374,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			closeAuthDialog();
 			if (!result.ok) {
 				if (!result.error?.silent) {
-					toast(t("toast.providerAuthFailed", { reason: result.error?.message || String(result.error) }), "error", 8_000);
+					// A network failure usually happens before any dialog appears, so
+					// explain the cause instead of showing a bare reason string.
+					const hasApiKey = (provider.authMethods || []).some((item) => item.type === "api_key");
+					if (result.error?.code === AuthErrorCode.NETWORK) {
+						toast(t("toast.providerAuthNetwork", { provider: provider.name, hint: hasApiKey ? t("auth.tryApiKey") : "" }), "error", 10_000);
+					} else {
+						toast(t("toast.providerAuthFailed", { reason: result.error?.message || String(result.error) }), "error", 8_000);
+					}
 				}
 				return;
 			}

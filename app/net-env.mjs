@@ -23,10 +23,14 @@
  * Explicit process environment always wins; dotenv values only fill gaps.
  */
 
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveProxy } from "./http.mjs";
+
+export { resolveProxy };
 
 /** Variables a dotenv file may contribute. Anything else in the file is ignored. */
 export const ENV_FILE_KEYS = Object.freeze([
@@ -153,6 +157,35 @@ export function applyNetworkEnv({ agentDir, appRoot, home = homedir(), env = pro
 		nodeOptions,
 		proxy: env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || env.TSUKUYOMI_CURL_PROXY,
 	};
+}
+
+/**
+ * True when the process should be started again with proxy support enabled.
+ *
+ * `NODE_USE_ENV_PROXY` is the only way to make Node's built-in fetch honour
+ * `HTTP(S)_PROXY`, but Node reads it at startup, so it has to be set before the
+ * process begins. Rather than making users export it, Tsukuyomi restarts itself
+ * once with it when a proxy is configured. Older runtimes ignore the variable
+ * and keep working through the curl fallbacks.
+ */
+export function needsProxyRestart(env = process.env) {
+	return Boolean(resolveProxy(env)) && env.NODE_USE_ENV_PROXY !== "1" && env.TSUKUYOMI_NET_PROXY_EXEC !== "1";
+}
+
+/**
+ * Re-execute the current script with proxy support enabled and return its exit
+ * status, or undefined when the restart could not be performed (the caller
+ * should then continue without it).
+ */
+export function restartWithProxy({ env = process.env, spawn = spawnSync } = {}) {
+	const script = process.argv[1];
+	if (!script) return undefined;
+	const result = spawn(process.execPath, [script, ...process.argv.slice(2)], {
+		stdio: "inherit",
+		env: { ...env, NODE_USE_ENV_PROXY: "1", TSUKUYOMI_NET_PROXY_EXEC: "1" },
+	});
+	if (result.error) return undefined;
+	return result.status === null ? 1 : result.status;
 }
 
 /** Child-process environment additions (proxy + NODE_OPTIONS) for the PI kernel. */

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { findPi, findPiRoot } from "../app/pi-runtime.mjs";
-import { applyNetworkEnv, networkEnvForChild } from "../app/net-env.mjs";
+import { applyNetworkEnv, needsProxyRestart, networkEnvForChild, restartWithProxy } from "../app/net-env.mjs";
 import { migrate } from "../app/migration.mjs";
 import { WorkspacePool, sessionlessArgs } from "../app/workspaces.mjs";
 import { TaskService } from "../app/task-service.mjs";
@@ -27,6 +27,14 @@ const PI_AGENT_DIR = join(HOME, ".pi", "agent");
 const network = applyNetworkEnv({ agentDir: AGENT_DIR, appRoot: ROOT, home: HOME });
 if (network.hookPath && !network.hookInstalled) {
 	console.error("Tsukuyomi: continuing without the curl-fetch hook; OpenAI sign-in may fail with a region error.");
+}
+// Node only honours HTTP(S)_PROXY for fetch when NODE_USE_ENV_PROXY is set at
+// startup, so restart once with it. Without this, provider endpoints that are
+// only reachable through the proxy (api.x.ai and friends) fail with
+// "fetch failed" even after a successful sign-in.
+if (needsProxyRestart()) {
+	const status = restartWithProxy();
+	if (status !== undefined) process.exit(status);
 }
 
 
