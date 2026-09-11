@@ -421,3 +421,40 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 - 若**完全没有出现登录界面**，通常是登录端点在发起请求前就失败了。此时会显示：
   「直连与代理都无法访问 xAI 的登录端点。你也可以改用 API Key 登录。」
   处理：`TSUKUYOMI_CURL_FETCH_DEBUG=1 tsukuyomi` 观察 `auth.x.ai` 是否被 curl 接管；确认代理可用；或直接用 API Key 登录。
+
+## 15. `/status` 额度查询支持矩阵
+
+`/status` 只查询**该供应商自己的**额度接口，且按凭据类型区分能力：
+
+| 供应商 | 凭据类型 | 接口 | 展示内容 |
+| --- | --- | --- | --- |
+| Anthropic（Claude Pro/Max） | OAuth | `GET https://api.anthropic.com/api/oauth/usage` | 5 小时窗口、7 天窗口、Sonnet/Opus 分项周额度、Extra Usage 额度 |
+| OpenAI Codex（ChatGPT） | OAuth | `chatgpt.com/backend-api/wham/usage` | 主/次速率窗口、额度金、计划类型 |
+| OpenRouter | API Key | `GET https://openrouter.ai/api/v1/key` | 本月用量、上限、剩余额度 |
+| DeepSeek | API Key | `GET https://api.deepseek.com/user/balance` | 余额（含币种） |
+| xAI / Grok | OAuth / API Key | — | **无公开额度接口**，见下 |
+| 其它（含自定义与代理） | — | — | 明确返回“无支持的额度接口” |
+
+### Anthropic 实现细节（与 Claude Code `/usage` 一致）
+
+- 请求头：`Authorization: Bearer <OAuth access>`、`anthropic-beta: oauth-2025-04-20`、`User-Agent: claude-code/`、`Accept/Content-Type: application/json`。
+- **`User-Agent: claude-code/` 是必需的**：缺失时该接口会持续返回 429。
+- 响应字段：`five_hour`、`seven_day`、`seven_day_sonnet`、`seven_day_opus`、`seven_day_oauth_apps`、`seven_day_cowork`，每项含 `utilization` 与 `resets_at`；另有 `extra_usage: { is_enabled, monthly_limit, used_credits, utilization }`。
+- `utilization` 在不同部署下既可能是小数（0.34）也可能是百分数（34.0）。Tsukuyomi 按整份响应中最大的取值判定比例，再统一换算为百分比。
+- 仅**订阅（OAuth）**账号支持；API Key 账号没有公开用量接口，会明确提示并给出控制台链接。
+- 可用 `TSUKUYOMI_ANTHROPIC_USAGE_URL` 覆盖接口地址（例如自建兼容网关）。
+
+### xAI / Grok 为什么查不到
+
+xAI **没有**对外提供额度或余额 REST 接口（已核对官方文档）：
+
+- API 用量在控制台：<https://console.x.ai/usage>；
+- 订阅（SuperGrok / X Premium）是**每周共享额度池**，在 `Settings → Usage` 查看；
+- 速率限制只在**模型调用响应头**中返回（`x-ratelimit-limit-requests`、`x-ratelimit-remaining-requests`、`x-ratelimit-reset-requests`），前端不做模型调用，因此无法主动获取。
+
+因此 `/status` 会明确显示「此供应商没有公开的额度接口，请打开下方用量页面查看」，并按凭据类型给出对应链接——而不是伪造一个必然失败的请求。
+
+### 安全约束
+
+- 适配器声明了所属主机；若模型的 `baseUrl` 指向其它主机（自建代理/网关），查询会被拒绝，避免把订阅令牌发给第三方。
+- 凭据只取自该供应商 id 对应的条目，不会借用其它供应商的密钥。

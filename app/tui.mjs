@@ -934,6 +934,8 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			case "malformed": return t("status.requestFailed", { reason: t("status.malformed") });
 			case "timeout": return t("status.requestFailed", { reason: t("status.timeout", {}) });
 			case "endpoint": return t("status.requestFailed", { reason: t("status.endpoint", {}) });
+			case "no-endpoint": return t("status.noEndpoint");
+			case "rate-limited": return t("status.rateLimited");
 			case "network": return t("status.requestFailed", { reason: t("status.network") });
 			case "fetch-unavailable": return t("status.requestFailed", { reason: t("status.fetchUnavailable", {}) });
 			default: return t("status.requestFailed", { reason: result?.reason || t("status.notAvailable") });
