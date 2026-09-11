@@ -11,7 +11,11 @@
  */
 
 import { authError, AuthErrorCode } from "../errors.mjs";
+import { createProxyAwareFetch } from "../../http.mjs";
 import { interpolate, normalizeProvider } from "./opencode.mjs";
+
+/** Discovery talks to arbitrary self-hosted endpoints; proxy-aware by default. */
+const proxyAwareFetch = createProxyAwareFetch();
 
 /** Strip a trailing `/models` so `.../v1` and `.../v1/models` both work. */
 function modelsEndpoint(baseURL) {
@@ -27,12 +31,12 @@ function pickName(item) {
  * Discover models from an OpenAI-compatible endpoint.
  * @returns {Promise<{id: string, name: string}[]>}
  */
-export async function discoverOpenAICompatible(baseURL, apiKey, { fetchImpl = globalThis.fetch, signal, timeoutMs = 15_000 } = {}) {
+export async function discoverOpenAICompatible(baseURL, apiKey, { fetchImpl = proxyAwareFetch, signal, timeoutMs = 15_000 } = {}) {
 	return requestModels(modelsEndpoint(baseURL), { Authorization: `Bearer ${apiKey}`, Accept: "application/json" }, { fetchImpl, signal, timeoutMs });
 }
 
 /** Discover models from an Anthropic-compatible endpoint. */
-export async function discoverAnthropicCompatible(baseURL, apiKey, { fetchImpl = globalThis.fetch, signal, timeoutMs = 15_000 } = {}) {
+export async function discoverAnthropicCompatible(baseURL, apiKey, { fetchImpl = proxyAwareFetch, signal, timeoutMs = 15_000 } = {}) {
 	return requestModels(
 		modelsEndpoint(baseURL.replace(/\/v1\/?$/, "")),
 		{ "x-api-key": apiKey, "anthropic-version": "2023-06-01", Accept: "application/json" },

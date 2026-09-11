@@ -14,6 +14,7 @@
 
 import { createHash } from "node:crypto";
 import { fetchGptUsage, USAGE_PAGE_URL } from "../status.mjs";
+import { createProxyAwareFetch } from "../http.mjs";
 import { safeReadAuthStore } from "./store.mjs";
 
 export const quotaAdapters = {
@@ -53,8 +54,11 @@ export const quotaAdapters = {
 };
 
 export class ProviderUsageClient {
-	constructor({ agentDir, env = process.env, resolveAuth, fetchImpl = globalThis.fetch, now = Date.now, ttlMs = 30_000 } = {}) {
-		Object.assign(this, { agentDir, env, resolveAuth, fetchImpl, now, ttlMs });
+	constructor({ agentDir, env = process.env, resolveAuth, fetchImpl, now = Date.now, ttlMs = 30_000 } = {}) {
+		// Quota hosts are not always reachable directly; fall back to curl through
+		// the configured proxy instead of surfacing "fetch failed".
+		const fetcher = fetchImpl ?? createProxyAwareFetch({ env });
+		Object.assign(this, { agentDir, env, resolveAuth, fetchImpl: fetcher, now, ttlMs });
 		this.cache = new Map();
 	}
 

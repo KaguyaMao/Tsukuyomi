@@ -368,3 +368,41 @@ Tsukuyomi 写入时会把 opencode 插值改写成 PI 语法：
 | 模型列表为空 | 端点的 `/models` 无返回，或密钥无权限。可在 `providers.json` 中手写 `models`。 |
 | 自定义供应商不支持账号登录 | PI 的 `models.json` 仅支持 `oauth: "radius"`；其它自定义 OAuth 需由 PI 扩展提供。 |
 | 想彻底移除旧命令 | 删除 `bin/kaguyapi.mjs` 并同步 `package.json` 的 `bin`。 |
+
+## 12. 网络与代理（登录与额度）
+
+Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
+
+| 场景 | 端点 | 处理方式 |
+| --- | --- | --- |
+| OpenAI/Codex 账号登录与令牌刷新 | `auth.openai.com` | 经 curl 走代理 |
+| 账户额度查询（`/status`） | `chatgpt.com/backend-api/wham/usage` | 先直连，失败后经 curl 走代理 |
+| 自定义供应商模型发现 | 任意 `baseURL` | 先直连，失败后经 curl 走代理 |
+
+原因：Node 的原生 `fetch`（undici）默认**不读取** `HTTP_PROXY` / `HTTPS_PROXY`（除非用 `--use-env-proxy` 启动，且该选项对旧版 Node 不可用），而 OpenAI 还会拒绝数据中心 IP 的 TLS 指纹返回 `403 unsupported_country_region_territory`。因此：
+
+1. `app/net-env.mjs` 在启动时从 `.env` 读取代理（顺序：`<agent>/.env` → `~/.tsukuyomi` → `~/.kaguyapi` → `~/.pi` → `~/.codex`），并**不覆盖**你已显式导出的变量。
+2. `app/curl-fetch.cjs` 用 `curl -x <proxy>` 处理这些请求（curl 的 TLS 指纹被接受）。钩子默认只匹配**非流式**端点（`auth.openai.com`、`chatgpt.com/backend-api/wham/`），**不会**碰 `…/backend-api/codex/*` 等流式请求，避免破坏逐字输出。
+3. `app/http.mjs` 的 `createProxyAwareFetch()` 保留原生 fetch 为快路径，仅在连接类失败且已配置代理时用 curl 重试。
+
+相关变量：
+
+| 变量 | 说明 |
+| --- | --- |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | 标准代理变量（大小写均可） |
+| `TSUKUYOMI_CURL_PROXY` | 仅 curl 使用的代理，优先级最高 |
+| `TSUKUYOMI_ENV_FILE` | 指定读取哪个 `.env` |
+| `TSUKUYOMI_NO_PROXY_FILE=1` | 不读取任何 `.env` |
+| `TSUKUYOMI_CURL_FETCH` | 指定自定义 curl-fetch 钩子路径 |
+| `TSUKUYOMI_CURL_FETCH_MATCH` | 替换默认匹配规则（正则） |
+| `TSUKUYOMI_CURL_FETCH_EXTRA` | 在默认规则上追加一条（正则） |
+| `TSUKUYOMI_CURL_FETCH_DEBUG=1` | 打印每个被 curl 接管/放行的 URL |
+
+## 13. 故障排查补充
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `/status` 显示 `fetch failed` / “额度接口直连与代理均不可达” | 配额端点直连不可达，且代理重试也失败。确认代理进程在跑（默认 `127.0.0.1:12450`）、`HTTP_PROXY` 或 `TSUKUYOMI_CURL_PROXY` 正确；用 `TSUKUYOMI_CURL_FETCH_DEBUG=1 tsukuyomi` 观察是否被 curl 接管。 |
+| 登录后仍被判“该地区不支持” | 钩子未生效。检查 `app/curl-fetch.cjs` 是否存在、`NODE_OPTIONS` 是否被注入（启动日志无 “could not install the curl-fetch hook”）。 |
+| 模型输出卡住不动 | 钩子匹配范围被改得太宽，把流式端点也接管了。默认规则不含 `…/backend-api/codex/*`；如自定义了 `TSUKUYOMI_CURL_FETCH_MATCH`，请排除流式路径。 |
+| 自定义供应商“模型发现失败” | 端点或密钥问题；若端点仅代理可达，会自动重试，仍失败则为端点返回异常。 |
