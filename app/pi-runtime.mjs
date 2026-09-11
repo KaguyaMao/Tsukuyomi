@@ -17,18 +17,45 @@ export function findPi({ root = process.cwd(), home = process.env.HOME || "" } =
 	return candidates.find((candidate) => existsSync(candidate)) || null;
 }
 
-export function findPiRoot(piBin) {
-	const resolved = realpathSync(piBin);
-	let directory = dirname(resolved);
-	for (;;) {
-		// `pi-tui` is installed below the coding-agent package.  Returning that
-		// package root preserves the path contract used by app/tui.mjs.
-		if (existsSync(join(directory, "node_modules", "@earendil-works", "pi-tui", "dist", "index.js"))) return directory;
-		const parent = dirname(directory);
-		if (parent === directory) break;
-		directory = parent;
+/**
+ * Locate the PI package root (the directory that owns `dist/index.js` and a
+ * nested `@earendil-works/pi-tui`).
+ *
+ * `realpath(piBin)` alone is not enough: `pi` is often a shell wrapper
+ * (`~/.local/bin/pi`) that execs the real CLI, and walking up from a wrapper in
+ * `$HOME` finds nothing. So prefer the app's own node_modules, then walk up
+ * from the real binary, then fall back to well-known global install roots.
+ */
+export function findPiRoot(piBin, { appRoot } = {}) {
+	const packaged = (dir) => existsSync(join(dir, "dist", "index.js"));
+	const hasTui = (dir) => existsSync(join(dir, "node_modules", "@earendil-works", "pi-tui", "dist", "index.js"));
+	const candidates = [];
+	if (appRoot) {
+		candidates.push(join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent"));
+		candidates.push(join(appRoot, "runtime", "lib", "node_modules", "@earendil-works", "pi-coding-agent"));
 	}
-	throw new Error(`could not locate @earendil-works/pi-coding-agent for ${resolved}`);
+	try {
+		let directory = dirname(realpathSync(piBin));
+		for (;;) {
+			if (hasTui(directory)) {
+				candidates.push(directory);
+				break;
+			}
+			const parent = dirname(directory);
+			if (parent === directory) break;
+			directory = parent;
+		}
+	} catch {
+		// A missing/broken `pi` is reported by findPi(); keep looking elsewhere.
+	}
+	candidates.push(
+		"/usr/lib/node_modules/@earendil-works/pi-coding-agent",
+		"/usr/local/lib/node_modules/@earendil-works/pi-coding-agent",
+	);
+	const resolved = candidates.find((candidate) => packaged(candidate) && hasTui(candidate))
+		?? candidates.find((candidate) => packaged(candidate));
+	if (resolved) return resolved;
+	throw new Error(`could not locate @earendil-works/pi-coding-agent for ${piBin}`);
 }
 
 /**

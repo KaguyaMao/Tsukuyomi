@@ -123,6 +123,33 @@ export function migrate({ target, sources = [], appRoot, dryRun = false }) {
 		};
 		if (!ledger.detached) { detach(target); ledger.detached = true; }
 		let settings = json(join(target, "settings.json"));
+		// Backend-extension predicates, defined before the import loop so both the
+		// loop and the appRoot block below can use them.
+		const backend = appRoot ? join(appRoot, "src", "backend.ts") : undefined;
+		const LEGACY_PACKAGE_NAMES = new Set(["tsukuyomi", "kaguyapi"]);
+		const packageNameOf = (path) => {
+			try { return json(join(path, "package.json")).name; } catch { return undefined; }
+		};
+		// A backend extension owned by this app or by a previous kaguyapi /
+		// tsukuyomi install. Pruning these prevents a migrated config from loading
+		// two backends (the old one would re-register the same tools).
+		const legacyBackend = (entry) => {
+			if (!appRoot || typeof entry !== "string" || /^[!+-]/.test(entry)) return false;
+			if ([join(appRoot, "src"), join(appRoot, "src/index.ts"), backend].includes(entry)) return true;
+			const parent = entry.endsWith("/src") ? dirname(entry) : dirname(dirname(entry));
+			try {
+				return /\/src(?:\/index\.ts|\/backend\.ts)?$/.test(entry) && LEGACY_PACKAGE_NAMES.has(packageNameOf(parent));
+			} catch { return false; }
+		};
+		// A backend copied into `imported/<hash>/backend.ts` from a foreign install.
+		// Matched by name so an old absolute path that pointed outside the source
+		// tree is pruned even after being rewritten.
+		const foreignBackend = (entry) =>
+			Boolean(appRoot) &&
+			typeof entry === "string" &&
+			!/^[!+-]/.test(entry) &&
+			/\/(?:src\/)?backend\.ts$/.test(entry.replace(/\\/g, "/")) &&
+			resolve(target, entry) !== backend;
 		// Preserve the pre-migration settings.json exactly once. The flag is set
 		// even when the file is absent, so a later run does not mistake the
 		// settings.json we just wrote for a user original.
@@ -167,7 +194,12 @@ export function migrate({ target, sources = [], appRoot, dryRun = false }) {
 					if (typeof entry === "string" && entry.includes(source)) return entry.replace(source, target);
 					return entry;
 				});
-				const combined = [...(imported[resource] || []).map((entry) => rewrite(entry, resource)), ...existing];
+				// Never import a foreign/legacy backend extension; the app appends
+				// its own below.
+				const importedEntries = (imported[resource] || [])
+					.filter((entry) => resource !== "extensions" || !legacyBackend(entry))
+					.map((entry) => rewrite(entry, resource));
+				const combined = [...importedEntries, ...existing];
 				const unique = new Map();
 				for (const entry of combined) {
 					const id = typeof entry === "string" ? entry : entry.source;
@@ -180,14 +212,7 @@ export function migrate({ target, sources = [], appRoot, dryRun = false }) {
 			ledger.sources.push(source);
 		}
 		if (appRoot) {
-			const backend = join(appRoot, "src", "backend.ts");
-			const legacyBackend = (entry) => {
-				if (typeof entry !== "string" || /^[!+-]/.test(entry)) return false;
-				if ([join(appRoot, "src"), join(appRoot, "src/index.ts"), backend].includes(entry)) return true;
-				const parent = entry.endsWith("/src") ? dirname(entry) : dirname(dirname(entry));
-				try { return /\/src(?:\/index\.ts|\/backend\.ts)?$/.test(entry) && json(join(parent, "package.json")).name === "tsukuyomi"; } catch { return false; }
-			};
-			settings.extensions = [...new Set((settings.extensions || []).filter((entry) => !legacyBackend(entry))), backend];
+			settings.extensions = [...new Set((settings.extensions || []).filter((entry) => !legacyBackend(entry) && !foreignBackend(entry))), backend];
 			// pi auto-discovers these files; deduplicate identical plugin trees without deleting copies.
 			const candidates = [];
 			const auto = join(target, "extensions");

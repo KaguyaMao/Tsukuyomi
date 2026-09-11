@@ -77,3 +77,40 @@ test("migration sources are never modified", () => {
 		anthropic: { type: "api_key", key: "legacy-key" },
 	});
 });
+
+test("migration does not import a legacy kaguyapi backend extension", () => {
+	// A previous distro install: /opt/kaguyapi/{package.json,src/backend.ts}.
+	const legacyInstall = mkdtempSync(join(tmpdir(), "kaguyapi-install-"));
+	writeJson(join(legacyInstall, "package.json"), { name: "kaguyapi" });
+	const legacyBackend = join(legacyInstall, "src", "backend.ts");
+	writeJson(legacyBackend, { legacy: true });
+
+	const source = mkdtempSync(join(tmpdir(), "tsukuyomi-legacy-agent-"));
+	writeJson(join(source, "settings.json"), { extensions: [legacyBackend] });
+
+	const appRoot = mkdtempSync(join(tmpdir(), "tsukuyomi-app-"));
+	const backend = join(appRoot, "src", "backend.ts");
+	writeJson(backend, { backend: true });
+
+	const target = mkdtempSync(join(tmpdir(), "tsukuyomi-agent-"));
+	migrate({ target, sources: [source], appRoot });
+
+	const settings = JSON.parse(readFileSync(join(target, "settings.json"), "utf8"));
+	assert.deepEqual(settings.extensions, [backend]);
+});
+
+test("migration prunes a foreign backend already present in the target", () => {
+	const appRoot = mkdtempSync(join(tmpdir(), "tsukuyomi-app-"));
+	const backend = join(appRoot, "src", "backend.ts");
+	writeJson(backend, { backend: true });
+
+	const target = mkdtempSync(join(tmpdir(), "tsukuyomi-agent-"));
+	const foreign = join(target, "imported", "abc123", "backend.ts");
+	writeJson(foreign, { legacy: true });
+	writeJson(join(target, "settings.json"), { extensions: [foreign] });
+
+	migrate({ target, sources: [], appRoot });
+
+	const settings = JSON.parse(readFileSync(join(target, "settings.json"), "utf8"));
+	assert.deepEqual(settings.extensions, [backend]);
+});

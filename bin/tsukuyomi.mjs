@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { findPi, findPiRoot } from "../app/pi-runtime.mjs";
+import { applyNetworkEnv, networkEnvForChild } from "../app/net-env.mjs";
 import { migrate } from "../app/migration.mjs";
 import { WorkspacePool, sessionlessArgs } from "../app/workspaces.mjs";
 import { TaskService } from "../app/task-service.mjs";
@@ -19,6 +20,14 @@ const HOME = homedir();
 const LEGACY_AGENT_DIR = join(HOME, ".kaguyapi", "agent");
 const AGENT_DIR = process.env.TSUKUYOMI_DIR || process.env.KAGUYAPI_DIR || process.env.PI_CODING_AGENT_DIR || join(HOME, ".tsukuyomi", "agent");
 const PI_AGENT_DIR = join(HOME, ".pi", "agent");
+
+// Load proxy settings and install the curl-fetch hook before anything can make
+// a request. OAuth login runs in this process, so it needs both; the kernel
+// receives the same configuration through networkEnvForChild() below.
+const network = applyNetworkEnv({ agentDir: AGENT_DIR, appRoot: ROOT, home: HOME });
+if (network.hookPath && !network.hookInstalled) {
+	console.error("Tsukuyomi: continuing without the curl-fetch hook; OpenAI sign-in may fail with a region error.");
+}
 
 
 function bootstrap(options = {}) {
@@ -178,6 +187,8 @@ bootstrap();
 
 const env = {
 	...process.env,
+	// Proxy variables plus NODE_OPTIONS=--require <curl-fetch hook> for the kernel.
+	...networkEnvForChild(network),
 	PI_CODING_AGENT_DIR: AGENT_DIR,
 	TSUKUYOMI: "1",
 	AI_AGENT: process.env.AI_AGENT || "tsukuyomi",
@@ -186,7 +197,7 @@ const env = {
 
 let piRoot;
 try {
-	piRoot = findPiRoot(piBin);
+	piRoot = findPiRoot(piBin, { appRoot: ROOT });
 } catch (error) {
 	console.error(`Tsukuyomi: could not resolve the PI installation: ${error.message}`);
 	process.exit(1);
