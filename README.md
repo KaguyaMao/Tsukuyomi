@@ -27,10 +27,35 @@ The original `pi` command and `~/.pi/agent` remain untouched.
 - `/sessions` or `Ctrl+S` opens a full-screen, searchable session browser grouped by workspace. `Tab` filters the current workspace and `Delete` moves a session to the recoverable `.trash` directory.
 - `/provider` opens a searchable OpenCode-style provider browser, including disconnected providers. Selecting one performs OAuth/API-key login when needed, then opens its model list. The final row asks only for id, name, URL and API key, discovers models from the `/models` endpoint, and persists the configuration to `providers.json` (and the derived `models.json`). Custom providers can also be authored by hand; see [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
 - Completed reasoning is collapsed by default. `Ctrl+E` expands the latest reasoning and inline semantic diff; edit diffs use old/new line numbers with red/green rows and a 14-line collapsed preview.
-- `/status` shows current-session token/context usage and queries the current provider: Codex account windows, OpenRouter key budget, or DeepSeek balance. Other providers explicitly report unsupported quota lookup; credentials are never borrowed from another provider. `/status refresh` bypasses the short cache.
+- `/status` shows current-session token/context usage and queries the current provider: xAI/Grok subscription plan (OAuth), Codex account windows, OpenRouter key budget, or DeepSeek balance. Providers without a public endpoint (for example xAI with an API key) state where usage actually lives instead of faking a request; credentials are never borrowed from another provider. `/status refresh` bypasses the short cache.
 - At widths below 120 columns, side panels become centered floating overlays instead of shrinking the conversation. `Ctrl+B`, `Ctrl+O`, and `Ctrl+T` independently open Files, Workflow, and Todo.
 - The session editor uses a hardware blinking bar and leaves the character under the cursor painted normally, which keeps IME pre-edit text readable.
 - Mouse input is first-class: click dialog rows to choose them, close controls to dismiss panels, directories to expand them, files to insert an `@path` reference, Workflow cards to expand output, timeline ticks to jump between turns, and composer metadata to select model/mode. The wheel scrolls Files, Workflow, Todo, or the transcript under the pointer; each scrollbar can be dragged. On Linux, middle-click pastes the PRIMARY selection like Grok Build. Set `TSUKUYOMI_TOUCH_MODE=1` or use `/touch on` to disable transcript drag selection for touchscreens.
+
+## Markdown rendering
+
+Tsukuyomi renders Markdown in the terminal using a self-contained, zero-dependency renderer (`app/markdown.mjs`) with no runtime libraries. Output is terminal-ready lines carrying SGR/OSC 8 sequences, so colors and clickable links work in terminals that support them (for example iTerm2, WezTerm, Ghostty, Kitty, and recent GNOME/VTE).
+
+Markdown is applied in four places:
+
+- **Chat message body** (assistant and user turns): headings, paragraphs, lists, block quotes, tables, horizontal rules, and fenced/indented code blocks. Inline bold, italic, strikethrough, inline code, links, autolinks, and images (shown as alt text) are supported. Streaming text is wrapped incrementally and only re-rendered Markdown once the message is finalized, to avoid reflow jitter and O(n²) re-parsing.
+- **Code blocks**: fenced blocks get a language label and lightweight syntax highlighting for `js`/`ts`/`json`/`python`/`bash`/`yaml`/`sql`/`xml`/`css`/`markdown` and more; unknown languages fall back to plain text. Code blocks are never auto-wrapped, so long lines are kept intact.
+- **Tool output and file previews**: plain `text` tool rows (for example `read`/`exec` output and `web_fetch` bodies) get inline Markdown; file content read by a file tool is highlighted per line by its extension. Diffs, JSON trees, and other structured tool output keep their existing rendering.
+- **Command descriptions**: option descriptions in the command/model/tool pickers are rendered with inline Markdown.
+
+Supported syntax:
+
+- Headings `#`–`######`
+- Bold `**x**` / `__x__`, italic `*x*` / `_x_`, strikethrough `~~x~~`
+- Inline code `` `x` ``
+- Links `[text](url)` with OSC 8 hyperlinks, plus autolinks and bare URLs
+- Unordered `-`/`*`/`+`, ordered `1.`, and task `- [ ]` / `- [x]` lists, with nesting
+- Block quotes `>` (nestable)
+- GFM tables with left/center/right alignment
+- Horizontal rules `---`
+- Fenced ```` ``` ```` and indented code blocks
+
+The renderer is SGR-aware: word wrapping preserves styles, and each emitted line is independent (it re-opens and resets its own styles) so the surrounding UI can prefix indentation without breaking formatting. A `markdown` preference (default on) in `tsukuyomi.json` disables all of the above and falls back to plain text wrapping; toggle it from **Settings → Render Markdown in chat** or set `markdown: false` in `~/.tsukuyomi/agent/tsukuyomi.json`.
 
 ## PI compatibility
 

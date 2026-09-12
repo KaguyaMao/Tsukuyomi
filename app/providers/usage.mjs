@@ -33,6 +33,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { fetchGptUsage, USAGE_PAGE_URL } from "../status.mjs";
 import { createProxyAwareFetch, isNetworkError } from "../http.mjs";
 import { safeReadAuthStore } from "./store.mjs";
@@ -264,7 +265,15 @@ export class ProviderUsageClient {
 		// Quota hosts are not always reachable directly; fall back to curl through
 		// the configured proxy instead of surfacing "fetch failed".
 		const fetcher = fetchImpl ?? createProxyAwareFetch({ env });
-		Object.assign(this, { agentDir, env, resolveAuth, fetchImpl: fetcher, now, ttlMs, timeoutMs });
+		// Resolve the credential directory the same way the rest of the app does
+		// (tui.mjs reads PI_CODING_AGENT_DIR and falls back to ~/.tsukuyomi/agent).
+		// Without this, a missing env var would make credential lookup fail and the
+		// status view would wrongly report "no public endpoint" instead of the
+		// real subscription plan.
+		const resolvedAgentDir = agentDir
+			|| env?.PI_CODING_AGENT_DIR
+			|| join(process.env.HOME || "", ".tsukuyomi", "agent");
+		Object.assign(this, { agentDir: resolvedAgentDir, env, resolveAuth, fetchImpl: fetcher, now, ttlMs, timeoutMs });
 		this.cache = new Map();
 	}
 

@@ -63,6 +63,7 @@ import { removeProviderConfig, saveProviderConfig } from "./providers/config/ope
 import { buildCustomProvider } from "./providers/config/discovery.mjs";
 import { removeProviderFromModelsJson, syncProviderToModelsJson, toProviderConfigInput } from "./providers/config/sync.mjs";
 import { ProviderUsageClient } from "./providers/usage.mjs";
+import { renderMarkdown, inlineAnsi, highlight, langFromPath } from "./markdown.mjs";
 
 const ESC = "\x1b[";
 // Zero-width APC marker the bundled Editor emits at the hardware-cursor cell.
@@ -94,6 +95,7 @@ const color = {
 	error: rgb(255, 116, 139),
 	border: rgb(68, 68, 72),
 };
+const DIM_OPEN = `${ESC}38;2;82;82;82m`;
 
 const BAND_BACKGROUND = `${ESC}48;2;36;36;36m`;
 const bandBackground = (value) => paintBackground(value, BAND_BACKGROUND);
@@ -477,6 +479,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		showWorkflow: preferences.rightSidebarDefault !== false,
 		showTodos: preferences.rightSidebarDefault !== false,
 		thinkingAutoCollapse: preferences.thinkingAutoCollapse !== false,
+		markdown: preferences.markdown !== false,
 		fileScroll: 0,
 		workflowScroll: 0,
 		todoScroll: 0,
@@ -600,6 +603,53 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		slots.set(field, { width, value, lines });
 		return lines;
 	};
+
+	// Markdown rendering is idempotent for a given (owner, value, width), so it
+	// can be memoized the same way as plain wrapping. The history cache rebuild
+	// already forces re-rendering on workflow changes; this avoids re-parsing
+	// large assistant messages on every unrelated render frame.
+	const markdownMemo = new WeakMap();
+	const markdownCached = (owner, field, value, width) => {
+		if (!owner || typeof value !== "string") return renderMarkdown(value, { width });
+		let slots = markdownMemo.get(owner);
+		if (!slots) { slots = new Map(); markdownMemo.set(owner, slots); }
+		const cached = slots.get(field);
+		if (cached && cached.width === width && cached.value === value) return cached.lines;
+		const lines = renderMarkdown(value, { width });
+		slots.set(field, { width, value, lines });
+		return lines;
+	};
+
+	// Respect the Markdown preference. When enabled, chat text is returned as
+	// SGR-decorated rows (sgr: true) that must NOT be re-colored. When disabled,
+	// fall back to the plain wrapper the rest of the UI re-colors with color.text.
+	const textRows = (owner, field, value, width) => {
+		if (state.markdown) {
+			return { rows: owner ? markdownCached(owner, field, value, width) : renderMarkdown(value, { width }), sgr: true };
+		}
+		return { rows: owner ? wrapCached(owner, field, value, width) : wrap(value, width), sgr: false };
+	};
+
+	// Markdown for tool output rows. Block-level Markdown does not fit the
+	// line-oriented tool renderer, so plain `text` rows get inline styling
+	// (links, inline code, emphasis) and, for file-read tools, per-line syntax
+	// highlighting chosen by the file extension. Other row kinds (diff add/remove,
+	// headers, metadata) keep their existing coloring. Disabled when Markdown is off.
+	const isReadLike = (name) => /^(read|view|cat|open|show|preview)$/i.test(name || "");
+	const toolRowContent = (row, tool, name) => {
+		const raw = String(row.text ?? "").replace(/[\r\n\t]/g, " ");
+		if (!state.markdown || row.kind !== "text") return clean(raw);
+		const path = tool?.args?.path || tool?.args?.file;
+		const lang = path ? langFromPath(path) : undefined;
+		const decorated = lang && isReadLike(name) ? highlight(raw, lang) : inlineAnsi(raw);
+		return clean(decorated);
+	};
+	// Markdown-decorated rows already carry their own SGR, so they must not be
+	// re-wrapped by the per-kind color (which would reset their base color).
+	const toolRowPaint = (row) =>
+		(state.markdown && row.kind === "text")
+			? (value) => value
+			: (row.kind === "add" ? color.success : row.kind === "remove" ? color.error : row.kind === "header" ? color.accent : row.kind === "footer" ? color.secondary : color.muted);
 
 	let toastExpiryRendered = false;
 	const toast = (message, type = "info", duration = 4_000) => {
@@ -1801,19 +1851,21 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	editor.onSubmit = (value) => { void runInput(value); };
 
 	const openSettings = () => {
-		const options = [t("settings.language"), t("settings.rightSidebar"), t("settings.thinking"), t("settings.touch")];
+		const options = [t("settings.language"), t("settings.rightSidebar"), t("settings.thinking"), t("settings.touch"), t("settings.markdown")];
 		openLocalSelect({ title: t("settings.title"), message: t("settings.message"), options,
 			descriptions: new Map([
 				[options[0], languageName()],
 				[options[1], state.showWorkflow || state.showTodos ? t("settings.on") : t("settings.off")],
 				[options[2], state.thinkingAutoCollapse ? t("settings.on") : t("settings.off")],
 				[options[3], state.touchMode ? t("settings.on") : t("settings.off")],
+				[options[4], state.markdown ? t("settings.on") : t("settings.off")],
 			]), onResolve: (result) => {
 				const index = options.indexOf(result?.value);
 				if (index === 0) openLanguageSelector();
 				if (index === 1) { const next = !(state.showWorkflow || state.showTodos); state.showWorkflow = next; state.showTodos = next; savePreferences(env?.PI_CODING_AGENT_DIR, { rightSidebarDefault: next }); }
 				if (index === 2) { state.thinkingAutoCollapse = !state.thinkingAutoCollapse; savePreferences(env?.PI_CODING_AGENT_DIR, { thinkingAutoCollapse: state.thinkingAutoCollapse }); }
 				if (index === 3) { state.touchMode = !state.touchMode; savePreferences(env?.PI_CODING_AGENT_DIR, { touchMode: state.touchMode }); }
+				if (index === 4) { state.markdown = !state.markdown; savePreferences(env?.PI_CODING_AGENT_DIR, { markdown: state.markdown }); }
 			},
 		});
 	};
@@ -1894,11 +1946,11 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const timeWidth = visibleWidth(timeText);
 			const promptWidth = Math.max(1, bandWidth - prefixWidth - 1 - timeWidth);
 			const rows = [];
-			const lines = owner ? wrapCached(owner, "band", prompt, promptWidth) : wrap(prompt, promptWidth);
+			const { rows: lines, sgr } = textRows(owner, "band", prompt, promptWidth);
 			for (let index = 0; index < lines.length; index++) {
 				let row = index > 0
-					? `${" ".repeat(prefixWidth + 1)}${color.text(lines[index])}`
-					: `${prefix} ${color.text(lines[0] || " ")}`;
+					? `${" ".repeat(prefixWidth + 1)}${sgr ? lines[index] : color.text(lines[index])}`
+					: `${prefix} ${sgr ? (lines[0] || " ") : color.text(lines[0] || " ")}`;
 				if (index === 0 && timeWidth > 0) {
 					row = pad(row, Math.max(2, bandWidth - timeWidth - 1)) + timeText;
 				}
@@ -1991,9 +2043,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				const rows = [];
 				const start = tailLength;
 				for (const row of tool.rows(locale, tui.terminal.rows)) {
-					const painter = row.kind === "add" ? color.success : row.kind === "remove" ? color.error : row.kind === "header" ? color.accent : row.kind === "footer" ? color.secondary : color.muted;
+					const painter = toolRowPaint(row);
 					const mark = row.kind === "header" ? "╭" : row.kind === "footer" ? "╰" : "│";
-					rows.push(`  ${color.border(mark)} ${painter(truncateToWidth(clean(row.text).replace(/[\r\n\t]/g, " "), Math.max(1, inner - 3), "…"))}`);
+					const text = truncateToWidth(toolRowContent(row, tool, name), Math.max(1, inner - 3), "…");
+					rows.push(`  ${color.border(mark)} ${painter(text)}`);
 				}
 				pushTailSegment(rows, (line) => line);
 				tailRanges.push({ id, start, end: tailLength });
@@ -2080,19 +2133,20 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						if (!state.thinkingAutoCollapse || state.thinkingExpanded.has(index)) {
 							for (const line of wrapCached(part, "thinking", part.thinking, Math.max(4, inner - 6))) lines.push(`    ${color.muted(line || " ")}`);
 						} else lines.push(`    ${color.dim(t("status.thinkingCollapsed"))}`);
-					} else if (part.type === "text") {
-						if (!(part.text || "").trim()) continue;
-						const allowTime = firstTextRow && timeWidth > 0;
-						const wrapWidth = allowTime ? Math.max(4, inner - timeWidth - 4) : Math.max(4, inner - 2);
-						for (const line of wrapCached(part, "text", part.text, wrapWidth)) {
-							let row = `  ${color.text(line || " ")}`;
-							if (allowTime && firstTextRow) {
-								firstTextRow = false;
-								row = pad(row, Math.max(1, width - timeWidth)) + timeText;
-							}
-							lines.push(row);
+				} else if (part.type === "text") {
+					if (!(part.text || "").trim()) continue;
+					const allowTime = firstTextRow && timeWidth > 0;
+					const wrapWidth = allowTime ? Math.max(4, inner - timeWidth - 4) : Math.max(4, inner - 2);
+					const { rows: textLines, sgr: textSgr } = textRows(part, "text", part.text, wrapWidth);
+					for (const line of textLines) {
+						let row = `  ${textSgr ? (line || " ") : color.text(line || " ")}`;
+						if (allowTime && firstTextRow) {
+							firstTextRow = false;
+							row = pad(row, Math.max(1, width - timeWidth)) + timeText;
 						}
-					} else if (part.type === "toolCall" && part.name !== "todo") {
+						lines.push(row);
+					}
+				} else if (part.type === "toolCall" && part.name !== "todo") {
 						const id = part.id || part.toolCallId;
 						const toolResult = cache.toolResults.get(id);
 						let tool = state.liveTools.get(id);
@@ -2103,9 +2157,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						}
 						const start = lines.length;
 						for (const row of tool.rows(locale, tui.terminal.rows)) {
-							const painter = row.kind === "add" ? color.success : row.kind === "remove" ? color.error : row.kind === "header" ? color.accent : row.kind === "footer" ? color.secondary : color.muted;
+							const painter = toolRowPaint(row);
 							const mark = row.kind === "header" ? "╭" : row.kind === "footer" ? "╰" : "│";
-							lines.push(`  ${color.border(mark)} ${painter(truncateToWidth(clean(row.text).replace(/[\r\n\t]/g, " "), Math.max(1, inner - 3), "…"))}`);
+							const text = truncateToWidth(toolRowContent(row, tool, part.name), Math.max(1, inner - 3), "…");
+							lines.push(`  ${color.border(mark)} ${painter(text)}`);
 						}
 						localToolRanges.push({ id, start, end: lines.length });
 					}
@@ -2645,7 +2700,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						? menuSelection(pad(optionLine, innerWidth))
 						: `${selected ? color.accent("❯") : " "} ${selected ? bold(color.text(option)) : color.muted(option)}`);
 					const description = dialog.descriptions?.get(option);
-					if (description && selected && !dialog.searchable) content.push(`  ${color.dim(description)}`);
+					if (description && selected && !dialog.searchable) {
+						const shown = state.markdown ? inlineAnsi(description, DIM_OPEN) : description;
+						content.push(`  ${color.dim(shown)}`);
+					}
 				}
 				if (last < dialog.options.length) content.push(color.dim(`  ${t("dialog.moreDown", { count: dialog.options.length - last })}`));
 			} else if (dialog.kind === "multi") {
@@ -2664,7 +2722,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					optionRows.push({ row: content.length, index });
 					content.push(`${selected ? color.accent("❯") : " "} ${marker} ${selected ? bold(color.text(option)) : color.muted(option)}`);
 					const description = dialog.descriptions?.get(option) || state.tools.labels[option] || t(TOOL_LABEL_KEYS[option] || option);
-					if (description && selected) content.push(`  ${color.dim(description)}`);
+					if (description && selected) {
+						const shown = state.markdown ? inlineAnsi(description, DIM_OPEN) : description;
+						content.push(`  ${color.dim(shown)}`);
+					}
 				}
 				if (last < dialog.options.length) content.push(color.dim(`  ${t("dialog.moreDown", { count: dialog.options.length - last })}`));
 			} else if (dialog.kind === "status") {
