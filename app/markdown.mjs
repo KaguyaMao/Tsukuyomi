@@ -75,11 +75,15 @@ export function visibleLength(value) {
 			i = k + 1;
 			continue;
 		}
-		length += charWidth(ch.codePointAt(0));
-		i++;
+		const cp = str.codePointAt(i);
+		length += charWidth(cp);
+		i += cp > 0xffff ? 2 : 1;
 	}
 	return length;
 }
+
+const OSC8_CLOSE = "\x1b]8;;\x1b\\";
+const osc8Open = (url) => `\x1b]8;;${url}\x1b\\`;
 
 /** SGR-aware word wrapping. `text` may contain embedded styling; each emitted
  *  line re-opens the styles active at its start and resets at its end. */
@@ -91,13 +95,18 @@ export function wrapAnsi(text, width, indent = "") {
 	let cur = indent;
 	let curWidth = indentWidth;
 	let active = [];
+	let activeUrl = null;
+	let prefix = "";
 	let hasContent = false;
 
 	const flush = () => {
-		lines.push((active.length ? active.join("") : "") + cur + RESET);
+		lines.push(prefix + cur + (activeUrl ? OSC8_CLOSE : "") + RESET);
 		cur = indent;
 		curWidth = indentWidth;
-		active = [];
+		// Styles still open at the end of this line are re-opened at the start
+		// of the next line, so wrapped plain text keeps its base colour (and
+		// bold/italic survive colour changes, hyperlinks stay clickable).
+		prefix = (activeUrl ? osc8Open(activeUrl) : "") + active.join("");
 		hasContent = false;
 	};
 
@@ -110,6 +119,7 @@ export function wrapAnsi(text, width, indent = "") {
 		}
 		if (hasContent && curWidth + token.width > width) flush();
 		updateActive(token.raw, active);
+		activeUrl = updateLink(token.raw, activeUrl);
 		cur += token.raw;
 		curWidth += token.width;
 		hasContent = true;
@@ -154,15 +164,60 @@ function tokenize(text) {
 			i++;
 			continue;
 		}
-		raw += ch;
-		width += charWidth(ch.codePointAt(0));
-		i++;
+		const cp = text.codePointAt(i);
+		raw += String.fromCodePoint(cp);
+		width += charWidth(cp);
+		i += cp > 0xffff ? 2 : 1;
 	}
 	pushWord();
 	return tokens;
 }
 
-/** Track currently-open SGR codes so wrapped continuation lines can reopen. */
+/** Track OSC 8 hyperlink state. Returns the URL active after `raw`
+ *  (null when outside a link). Handles `ESC]8;params;url ST` opens and
+ *  `ESC]8;; ST` closes in order. */
+function updateLink(raw, current) {
+	const re = /\x1b\]8;([^\x1b]*?)\x1b\\/g;
+	let match;
+	let url = current;
+	while ((match = re.exec(raw))) {
+		const content = match[1];
+		// Content is `params;uri` (params usually empty). URI is after the
+		// first semicolon; it may itself contain semicolons.
+		const sep = content.indexOf(";");
+		const uri = sep === -1 ? "" : content.slice(sep + 1);
+		url = uri ? uri : null;
+	}
+	return url;
+}
+
+/** Is this tracked SGR entry a foreground colour? */
+function isFgEntry(entry) {
+	if (entry.startsWith(`${ESC}38`)) return true;
+	return /^\x1b\[(3[0-7]|9[0-7])m$/.test(entry);
+}
+
+/** Is this tracked SGR entry a background colour? */
+function isBgEntry(entry) {
+	if (entry.startsWith(`${ESC}48`)) return true;
+	return /^\x1b\[(4[0-7]|10[0-7])m$/.test(entry);
+}
+
+function removeFg(active) {
+	for (let index = active.length - 1; index >= 0; index--) {
+		if (isFgEntry(active[index])) active.splice(index, 1);
+	}
+}
+
+function removeBg(active) {
+	for (let index = active.length - 1; index >= 0; index--) {
+		if (isBgEntry(active[index])) active.splice(index, 1);
+	}
+}
+
+/** Track currently-open SGR codes so wrapped continuation lines can reopen.
+ *  Colours replace only colours (bold/italic/underline survive colour
+ *  changes); a reset clears everything. */
 function updateActive(raw, active) {
 	const re = /\x1b\[([0-9;]*)m/g;
 	let match;
@@ -179,10 +234,34 @@ function updateActive(raw, active) {
 			else if (code === 24) removeStyle(active, "4");
 			else if (code === 29) removeStyle(active, "9");
 			else if (code === 38 || code === 48) {
-				active.length = 0;
+				// Extended colour (38/48;2;r;g;b or 38/48;5;n). The whole escape
+				// sequence re-applies everything it carries, so skip its params.
+				// Only the corresponding layer is replaced; decorations stay.
+				if (code === 38) removeFg(active);
+				else removeBg(active);
 				active.push(match[0]);
-			} else if ((code >= 30 && code <= 49) || code === 0) {
+				break;
+			} else if (code === 39) {
+				removeFg(active);
+			} else if (code === 49) {
+				removeBg(active);
+			} else if (
+				(code >= 30 && code <= 37) ||
+				(code >= 90 && code <= 97)
+			) {
+				removeFg(active);
+				active.push(`${ESC}${code}m`);
+			} else if (
+				(code >= 40 && code <= 47) ||
+				(code >= 100 && code <= 107)
+			) {
+				removeBg(active);
+				active.push(`${ESC}${code}m`);
+			} else if (code === 0) {
 				active.length = 0;
+			} else if (code === 1 || code === 3 || code === 4 || code === 9) {
+				const seq = `${ESC}${code}m`;
+				if (!active.includes(seq)) active.push(seq);
 			} else {
 				active.push(`${ESC}${code}m`);
 			}
@@ -190,10 +269,10 @@ function updateActive(raw, active) {
 	}
 }
 
-function removeStyle(active, baseCode) {
-	const prefix = `${ESC}${baseCode}`;
+function removeStyle(active, code) {
+	const target = `${ESC}${code}m`;
 	for (let index = active.length - 1; index >= 0; index--) {
-		if (active[index].startsWith(prefix)) active.splice(index, 1);
+		if (active[index] === target) active.splice(index, 1);
 	}
 }
 
@@ -221,46 +300,52 @@ function inlineToAnsi(input, base = BASE) {
 			continue;
 		}
 
-		// Inline code span (`...` or ``...``), content is literal.
+		// Inline code span (`...`, ``...``, ```...``` ...), content is literal.
 		if (ch === "`") {
-			let closeIndex = input.indexOf("`", i + 1);
-			let depth = 1;
-			while (closeIndex !== -1 && input[closeIndex - 1] === "`") {
-				depth++;
-				closeIndex = input.indexOf("`".repeat(depth), i + depth);
-				if (closeIndex === -1) break;
-			}
+			let run = 1;
+			while (i + run < n && input[i + run] === "`") run++;
+			const marker = "`".repeat(run);
+			const closeIndex = input.indexOf(marker, i + run);
 			if (closeIndex !== -1) {
-				const marker = "`".repeat(depth);
-				const content = input.slice(i + depth, closeIndex);
+				const content = input.slice(i + run, closeIndex);
 				out += `${fg(PAL.secondary)}${content}${close()}`;
-				i = closeIndex + depth;
+				i = closeIndex + run;
 				continue;
 			}
+			// No matching closer: emit the whole run as literal text.
+			out += marker;
+			i += run;
+			continue;
 		}
 
 		// Image (render alt text, drop the binary reference).
+		// Supports balanced parens in the URL, e.g. `![a](https://x/f(o))`.
 		if (ch === "!" && input[i + 1] === "[") {
-			const end = input.indexOf("]", i + 1);
-			const after = end !== -1 ? input.indexOf(")", end + 1) : -1;
-			if (end !== -1 && after !== -1) {
-				const alt = input.slice(i + 2, end);
-				out += `${fg(PAL.muted)}[${alt}]${close()}`;
-				i = after + 1;
-				continue;
+			const end = input.indexOf("]", i + 2);
+			if (end !== -1 && input[end + 1] === "(") {
+				const urlEnd = findLinkClose(input, end + 2);
+				if (urlEnd !== -1) {
+					const alt = input.slice(i + 2, end);
+					out += `${fg(PAL.muted)}[${alt}]${close()}`;
+					i = urlEnd + 1;
+					continue;
+				}
 			}
 		}
 
 		// Link [text](url) or autolink <url>.
+		// Supports balanced parens in the URL, e.g. Wikipedia `/wiki/PC_(DOS)`.
 		if (ch === "[") {
 			const end = input.indexOf("]", i + 1);
-			const after = end !== -1 ? input.indexOf(")", end + 1) : -1;
-			if (end !== -1 && after !== -1) {
-				const text = input.slice(i + 1, end);
-				const url = input.slice(end + 2, after);
-				out += emitLink(url, text, base);
-				i = after + 1;
-				continue;
+			if (end !== -1 && input[end + 1] === "(") {
+				const urlEnd = findLinkClose(input, end + 2);
+				if (urlEnd !== -1) {
+					const text = input.slice(i + 1, end);
+					const url = input.slice(end + 2, urlEnd);
+					out += emitLink(url, text, base);
+					i = urlEnd + 1;
+					continue;
+				}
 			}
 		}
 		if (ch === "<" && /https?:\/\//.test(rest().slice(1, 9))) {
@@ -324,11 +409,13 @@ function inlineToAnsi(input, base = BASE) {
 			}
 		}
 
-		// Bare URL.
+		// Bare URL (trailing punctuation like `,`/`.`/`!` is not part of it;
+		// a trailing `)`/`]`/`}` only counts when balanced).
 		const bare = /^(https?:\/\/[^\s<]+)/.exec(rest());
 		if (bare) {
-			out += emitLink(bare[1], bare[1], base);
-			i += bare[0].length;
+			const trimmed = trimBareUrl(bare[1]);
+			out += emitLink(trimmed, trimmed, base);
+			i += trimmed.length;
 			continue;
 		}
 
@@ -343,6 +430,54 @@ function emitLink(url, text, base) {
 	const open = `\x1b]8;;${safeUrl}\x1b\\`;
 	const close = `\x1b]8;;\x1b\\`;
 	return `${open}${UNDERLINE}${fg(PAL.accent)}${text}${RESET}${close}${base}`;
+}
+
+/** Find the `)` closing a `(url)` link destination that starts at `open`
+ *  (the index just after the opening `(`). Handles balanced `()` pairs so
+ *  URLs like `https://en.wikipedia.org/wiki/PC_(DOS)` work. Returns -1. */
+function findLinkClose(input, open) {
+	let depth = 0;
+	for (let k = open; k < input.length; k++) {
+		const c = input[k];
+		if (c === "\\" && k + 1 < input.length) {
+			k++;
+			continue;
+		}
+		if (c === "(") depth++;
+		else if (c === ")") {
+			if (depth === 0) return k;
+			depth--;
+		}
+		else if (c === " " || c === "\n" || c === "\t") {
+			// Link destinations must not contain unescaped whitespace
+			// (titles like `[t](u "title")` are out of scope: stop here).
+			return -1;
+		}
+	}
+	return -1;
+}
+
+/** Strip trailing punctuation from a bare-URL match. Keeps balanced
+ *  closers (`)`/`]`/`}`) only when they balance an opener inside the URL. */
+function trimBareUrl(url) {
+	let end = url.length;
+	// Closing brackets: drop surplus closers that have no opener.
+	for (const [open, close] of [["(", ")"], ["[", "]"], ["{", "}"]]) {
+		while (end > 0 && url[end - 1] === close) {
+			const slice = url.slice(0, end);
+			let opens = 0;
+			let closes = 0;
+			for (const c of slice) {
+				if (c === open) opens++;
+				else if (c === close) closes++;
+			}
+			if (closes > opens) end--;
+			else break;
+		}
+	}
+	// Sentence punctuation and quotes are never part of the URL.
+	while (end > 0 && `.,;:!?'"*`.includes(url[end - 1])) end--;
+	return url.slice(0, end) || url;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +527,8 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 			const level = heading[1].length;
 			const headingColor = level <= 2 ? fg(PAL.accent) : fg(PAL.text);
 			const prefix = "#".repeat(level) + " ";
-			const content = `${BOLD}${headingColor}${prefix}${inlineToAnsi(heading[2], headingColor)}`;
+			// Re-open bold after every inline span so headings stay bold throughout.
+			const content = `${BOLD}${headingColor}${prefix}${inlineToAnsi(heading[2], `${BOLD}${headingColor}`)}`;
 			pushBlock(wrapAnsi(content, width));
 			i++;
 			continue;
@@ -430,6 +566,21 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 			const list = parseList(lines, i);
 			i = list.nextIndex;
 			pushBlock(renderList(list.items, width));
+			continue;
+		}
+
+		// Indented code block (4 spaces or a tab). Cannot interrupt a
+		// paragraph: here we are always at a block boundary because paragraph
+		// lines are consumed greedily below, so any indented run is code.
+		if (/^(?: {4}|\t)/.test(line)) {
+			const body = [];
+			while (i < lines.length && /^(?: {4}|\t)/.test(lines[i])) {
+				body.push(lines[i].replace(/^(?: {4}|\t)/, "").replace(/\t/g, "  "));
+				i++;
+			}
+			// Trailing blank-adjacent runs of only whitespace are not code;
+			// the loop above already stops at blank lines.
+			pushBlock(renderCodeBlock(body, "", width));
 			continue;
 		}
 
@@ -472,7 +623,21 @@ function parseList(lines, startIndex) {
 	while (i < lines.length) {
 		const line = lines[i];
 		const m = /^( *)([-*+]|\d+[.)])[ \t]+(.*)$/.exec(line);
-		if (!m) break;
+		if (!m) {
+			// Indented continuation line belongs to the previous item
+			// (e.g. a wrapped description without a new marker).
+			if (
+				items.length > 0 &&
+				line.trim() !== "" &&
+				/^[ \t]+/.test(line) &&
+				!startsBlock(line.trimStart(), lines[i + 1])
+			) {
+				items[items.length - 1].text += ` ${line.trim()}`;
+				i++;
+				continue;
+			}
+			break;
+		}
 		const indent = m[1].length;
 		const markerToken = m[2];
 		const body = m[3];
@@ -522,7 +687,30 @@ function renderList(items, width) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function parseTable(lines, startIndex) {
-	const splitRow = (raw) => raw.replace(/^\s*\|?/, "").replace(/\|?\s*$/, "").split("|").map((cell) => cell.trim());
+	// Split on unescaped `|` so `\|` stays inside the cell.
+	const splitRow = (raw) => {
+		let s = String(raw).trim();
+		if (s.startsWith("|")) s = s.slice(1);
+		if (s.endsWith("|")) s = s.slice(0, -1);
+		const cells = [];
+		let cur = "";
+		for (let k = 0; k < s.length; k++) {
+			const c = s[k];
+			if (c === "\\" && k + 1 < s.length && (s[k + 1] === "|" || s[k + 1] === "\\")) {
+				cur += s[k + 1];
+				k++;
+				continue;
+			}
+			if (c === "|") {
+				cells.push(cur.trim());
+				cur = "";
+				continue;
+			}
+			cur += c;
+		}
+		cells.push(cur.trim());
+		return cells;
+	};
 	const header = splitRow(lines[startIndex]);
 	const aligns = splitRow(lines[startIndex + 1]).map((cell) => {
 		const left = cell.startsWith(":");
@@ -576,7 +764,9 @@ function renderTable(table, width) {
 	};
 
 	const renderRow = (cells) => {
-		const colLines = cells.map((cell, index) => padCell(cell, index));
+		const padded = [...cells];
+		while (padded.length < columns) padded.push("");
+		const colLines = padded.map((cell, index) => padCell(cell, index));
 		const rowHeight = Math.max(1, ...colLines.map((lines) => lines.length));
 		const out = [];
 		for (let r = 0; r < rowHeight; r++) {
@@ -622,7 +812,9 @@ function renderSeparator(widths, left, mid, right) {
 function renderCodeBlock(lines, lang, width) {
 	const rows = [];
 	const label = lang ? `${fg(PAL.secondary)}${lang}${RESET}` : "";
-	rows.push(`${fg(PAL.border)}──${label ? ` ${label}` : ""}${"─".repeat(Math.max(0, width - 4 - visibleLength(label)))}${RESET}`);
+	const labelWidth = visibleLength(label);
+	const topDashes = Math.max(0, width - 2 - (label ? 1 + labelWidth : 0));
+	rows.push(`${fg(PAL.border)}──${label ? ` ${label}` : ""}${"─".repeat(topDashes)}${RESET}`);
 	for (const line of lines) {
 		const hl = highlight(line, lang);
 		rows.push(`${fg(PAL.border)}│${RESET} ${hl}${RESET}`);
@@ -645,11 +837,15 @@ const LANGS = {
 	json: "json", py: "python", python: "python", bash: "bash", sh: "bash", shell: "bash",
 	zsh: "bash", yaml: "yaml", yml: "yaml", xml: "xml", html: "xml",
 	css: "css", sql: "sql", md: "markdown", markdown: "markdown",
+	rb: "ruby", ruby: "ruby", go: "go", rs: "rust", rust: "rust",
+	java: "java", kt: "kotlin", kotlin: "kotlin", c: "c", h: "c",
+	cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", cs: "csharp", csharp: "csharp",
 };
 
 const JS_KEYWORDS = new Set(["const","let","var","function","return","if","else","for","while","do","switch","case","break","continue","new","class","extends","super","this","import","export","from","default","async","await","yield","try","catch","finally","throw","typeof","instanceof","in","of","delete","void","null","undefined","true","false","static","get","set","public","private","protected","interface","type","enum","implements"]);
 const PY_KEYWORDS = new Set(["def","return","if","elif","else","for","while","break","continue","import","from","as","class","try","except","finally","with","lambda","yield","global","nonlocal","pass","raise","assert","async","await","in","is","not","and","or","None","True","False","self"]);
 const SQL_KEYWORDS = new Set(["select","from","where","insert","into","values","update","set","delete","create","table","drop","alter","join","left","right","inner","outer","on","group","by","order","limit","offset","having","as","and","or","not","null","distinct","count","sum","avg","min","max"]);
+const C_KEYWORDS = new Set(["if","else","for","while","do","switch","case","break","continue","return","goto","struct","union","enum","typedef","sizeof","static","const","volatile","extern","register","inline","class","public","private","protected","virtual","override","final","new","delete","this","namespace","using","template","typename","try","catch","throw","throws","finally","interface","implements","extends","super","package","import","func","fn","def","let","var","val","fun","type","trait","impl","match","where","in","is","as","null","true","false","nil","None","Some","self","pub","mod","use","crate","mut","ref","unsafe","go","defer","chan","range","select","map","require","module","begin","end","rescue","ensure"]);
 
 /** Lightweight, regex-based syntax highlighter. Returns an SGR string; the
  *  caller appends a reset. Unknown languages pass through unhighlighted. */
@@ -663,7 +859,9 @@ export function highlight(code, lang) {
 	if (normalized === "xml") return highlightXml(code);
 	if (normalized === "css") return highlightCss(code);
 	if (normalized === "markdown") return `${BASE}${code}`;
-	return highlightClike(code, normalized === "python" ? PY_KEYWORDS : JS_KEYWORDS);
+	if (normalized === "python") return highlightClike(code, PY_KEYWORDS);
+	if (normalized === "javascript" || normalized === "typescript") return highlightClike(code, JS_KEYWORDS);
+	return highlightClike(code, C_KEYWORDS);
 }
 
 function highlightClike(code, keywords) {
@@ -818,9 +1016,24 @@ function highlightBash(code) {
 		}
 		if (ch === "$" && code[i + 1] === "{") {
 			const end = code.indexOf("}", i + 2);
+			if (end === -1) {
+				// Unterminated ${...}: emit the rest literally instead of looping.
+				out += `${BASE}${code.slice(i)}${RESET}`;
+				i = n;
+				continue;
+			}
 			out += `${HL.func}${code.slice(i, end + 1)}${RESET}`;
 			i = end + 1;
 			continue;
+		}
+		// $VAR / $1 / $? / $# — highlight the whole variable.
+		if (ch === "$" && /[A-Za-z_0-9?#$!*]/.test(code[i + 1] || "")) {
+			const m = /^\$[A-Za-z_][\w]*|^\$[0-9?#$!*]/.exec(code.slice(i));
+			if (m) {
+				out += `${HL.func}${m[0]}${RESET}`;
+				i += m[0].length;
+				continue;
+			}
 		}
 		if (ch === "-" && /[A-Za-z]/.test(code[i + 1] || "")) {
 			const m = /^--?[A-Za-z][\w-]*/.exec(code.slice(i));
@@ -886,12 +1099,13 @@ function highlightSql(code) {
 
 function highlightXml(code) {
 	let out = "";
-	const re = /(&lt;\/?)([a-zA-Z0-9-]+)|("(?:[^"]*)")|(<!--[\s\S]*?-->)/g;
+	const re = /(<\/?)([a-zA-Z0-9-]+)|("(?:[^"]*)")|(<!--[\s\S]*?-->)/g;
 	let last = 0;
 	let m;
 	while ((m = re.exec(code))) {
 		out += `${BASE}${code.slice(last, m.index)}${RESET}`;
-		if (m[3]) out += `${HL.comment}${m[3]}${RESET}`;
+		if (m[4]) out += `${HL.comment}${m[4]}${RESET}`;
+		else if (m[3]) out += `${HL.string}${m[3]}${RESET}`;
 		else if (m[1]) out += `${HL.keyword}${m[1]}${RESET}${HL.func}${m[2]}${RESET}`;
 		last = re.lastIndex;
 	}
@@ -914,15 +1128,19 @@ function highlightCss(code) {
 		}
 		if (ch === "." || ch === "#") {
 			const m = /^[.#][A-Za-z_][\w-]*/.exec(code.slice(i));
-			out += `${HL.func}${m[0]}${RESET}`;
-			i += m[0].length;
-			continue;
+			if (m) {
+				out += `${HL.func}${m[0]}${RESET}`;
+				i += m[0].length;
+				continue;
+			}
 		}
 		if (ch === ":") {
-			const m = /^:[A-Za-z-]+/.exec(code.slice(i));
-			out += `${HL.property}${m[0]}${RESET}`;
-			i += m[0].length;
-			continue;
+			const m = /^:+[A-Za-z-]+/.exec(code.slice(i));
+			if (m) {
+				out += `${HL.property}${m[0]}${RESET}`;
+				i += m[0].length;
+				continue;
+			}
 		}
 		if (ch === '"' || ch === "'") {
 			const quote = ch;
@@ -949,6 +1167,7 @@ export const inlineAnsi = (text, base = BASE) => inlineToAnsi(text, base);
 /** Map a file path's extension to a highlighter language id. */
 export function langFromPath(path) {
 	if (!path || typeof path !== "string") return undefined;
+	const base = path.slice(path.lastIndexOf("/") + 1);
 	const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 	const map = {
 		js: "js", mjs: "js", cjs: "js", jsx: "js", ts: "ts", tsx: "ts", json: "json",
@@ -957,6 +1176,11 @@ export function langFromPath(path) {
 		sh: "bash", bash: "bash", zsh: "bash", yml: "yaml", yaml: "yaml", toml: "yaml",
 		xml: "xml", html: "xml", htm: "xml", svg: "xml", css: "css", sql: "sql",
 		md: "markdown", markdown: "markdown",
+		bashrc: "bash", zshrc: "bash",
 	};
-	return map[ext];
+	if (map[ext]) return map[ext];
+	// Dotfiles like `.bashrc` / `.zshrc` have no "real" extension.
+	const dotless = base.startsWith(".") ? base.slice(1).toLowerCase() : "";
+	if (dotless && map[dotless]) return map[dotless];
+	return undefined;
 }
