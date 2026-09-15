@@ -63,6 +63,8 @@ import { removeProviderConfig, saveProviderConfig } from "./providers/config/ope
 import { buildCustomProvider } from "./providers/config/discovery.mjs";
 import { removeProviderFromModelsJson, syncProviderToModelsJson, toProviderConfigInput } from "./providers/config/sync.mjs";
 import { ProviderUsageClient } from "./providers/usage.mjs";
+import { activeAccount, activateAccount, listAccounts, listAllAccounts, migrateAllCurrentCredentials, migrateCurrentCredential, saveAccount } from "./providers/accounts.mjs";
+import { getStoredCredential } from "./providers/store.mjs";
 import { renderMarkdown, inlineAnsi, highlight, langFromPath } from "./markdown.mjs";
 
 const ESC = "\x1b[";
@@ -900,7 +902,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 
 	const builtinNames = [
 		"new", "compact", "mode", "workspace", "files", "workflow", "todo", "sidebar", "model", "provider",
-		"thinking", "tools", "sessions", "language", "status", "touch", "help", "perf", "quit",
+		"thinking", "tools", "sessions", "language", "status", "accounts", "touch", "help", "perf", "quit",
 	];
 	const makeBuiltins = () => builtinNames.map((name) => ({
 		name,
@@ -1008,6 +1010,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const lines = [
 			`${t("status.currentModel")}: ${modelText}`,
 			`${t("status.provider")}: ${model?.provider || t("status.notAvailable")}`,
+			...(model?.provider && activeAccount(agentDir, model.provider) ? [`Account: ${listAccounts(agentDir, model.provider).find((item) => item.id === activeAccount(agentDir, model.provider))?.name || activeAccount(agentDir, model.provider)}`] : []),
 			"",
 			`${t("status.sessionUsage")}: ${total} ${t("status.total")} (${input} ${t("status.input")} + ${output} ${t("status.output")}${cacheDetail})${costDetail}`,
 		];
@@ -1450,6 +1453,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			// snapshot lagged; the restart below repairs it, so keep going.
 			if (result.warning) toast(t("auth.syncWarning"), "warning", 8_000);
 			else toast(t("toast.providerSignedIn", { provider: provider.name }), "info");
+			const providerId = method.providerId || provider.id;
+			const credential = getStoredCredential(agentDir, providerId);
+			if (credential) { const count = listAccounts(agentDir, providerId).length; saveAccount(agentDir, providerId, `account-${count + 1}`, credential, `Account #${count + 1}`); }
 			setTimeout(() => shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) }), 180);
 		} catch (error) {
 			closeAuthDialog();
@@ -1476,11 +1482,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		try {
 			const id = await localInputValue(t("custom.id"), t("custom.idHint"));
 			const name = await localInputValue(t("custom.name"), t("custom.nameHint"), { prefill: id });
+			const protocol = await localSelectValue("Provider protocol", ["OpenAI-compatible", "Claude-compatible"]);
 			const baseUrl = await localInputValue(t("custom.baseUrl"), t("custom.baseUrlHint"), { prefill: "https://" });
 			const apiKey = await localInputValue(t("custom.apiKey"), t("custom.apiKeyHint"), { secret: true });
 			// Discovery validates and fills in the model list; nothing is written
 			// until it succeeds, so a failed discovery leaves no partial config.
-			const config = await buildCustomProvider({ id, name, baseUrl, apiKey }, { env });
+			const api = protocol === "Claude-compatible" ? "anthropic-messages" : "openai-completions";
+			const config = await buildCustomProvider({ id, name, baseUrl, apiKey, api }, { env });
 			saveProviderConfig(agentDir, id, config);
 			syncProviderToModelsJson(agentDir, id, config);
 			await providers().registerProvider(id, toProviderConfigInput(config));
@@ -1519,6 +1527,19 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				if (result?.value === addLabel) { await addCustomProvider(); return; }
 				const provider = list[labels.indexOf(result?.value)];
 				if (!provider) return;
+				migrateCurrentCredential(agentDir, provider.id);
+				const accounts = listAccounts(agentDir, provider.id);
+				if (accounts.length > 1) {
+					const current = activeAccount(agentDir, provider.id);
+					const accountLabels = accounts.map((account) => `${account.id === current ? "● " : "○ "}${account.name}`);
+					accountLabels.push("+ Add account");
+					openLocalSelect({ title: `${provider.name} accounts`, options: accountLabels, onResolve: async (choice) => {
+						if (choice?.value === "+ Add account") return openProviderAuth(provider);
+						const account = accounts[accountLabels.indexOf(choice?.value)];
+						if (account && activateAccount(agentDir, provider.id, account.id)) shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) });
+					} });
+					return;
+				}
 				const auth = providerAuth(provider);
 				if (!auth.configured) { openProviderAuth(provider); return; }
 				const models = await providers().getModels(provider.id);
@@ -1565,6 +1586,50 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						applyModel(models[modelLabels.indexOf(choice?.value)]);
 					}, searchable: true });
 			}, searchable: true, sections });
+	};
+
+	const openAccounts = async () => {
+		migrateAllCurrentCredentials(agentDir);
+		let providerList = [];
+		try { providerList = await providers().providers(); } catch { /* listing must still work when the kernel is unavailable */ }
+		const providerById = new Map(providerList.map((provider) => [provider.id, provider]));
+		const entries = listAllAccounts(agentDir).map((entry) => ({
+			provider: providerById.get(entry.providerId) || { id: entry.providerId, name: entry.providerId },
+			account: entry,
+			current: entry.current,
+		}));
+		if (!entries.length) { toast("No saved accounts", "info"); return; }
+		const labels = entries.map(({ provider, account, current }) =>
+			`${current ? "●" : "○"} ${provider.name} · ${account.name}`);
+		openLocalSelect({
+			title: "Accounts",
+			message: "Select an account to activate",
+			options: labels,
+			descriptions: new Map(entries.map(({ provider, account }) => [
+				labels[entries.findIndex((item) => item.provider.id === provider.id && item.account.id === account.id)],
+				`${provider.id} · ${account.id}`,
+			])),
+			onResolve: (result) => {
+				const entry = entries[labels.indexOf(result?.value)];
+				if (!entry) return;
+				if (!entry.current && !activateAccount(agentDir, entry.provider.id, entry.account.id)) return;
+				// Switching providers also needs a model; otherwise the restarted
+				// session keeps using the previous provider and hides the switch.
+				providers().invalidate();
+				void providers().models(entry.provider.id).then((models) => {
+					const model = models[0];
+					shutdown(0, {
+						restart: "provider",
+						providerId: entry.provider.id,
+						...(model?.id ? { modelId: model.id } : {}),
+						...(state.sessionFile ? { session: state.sessionFile } : {}),
+					});
+				}).catch(() => {
+					shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) });
+				});
+			},
+			searchable: true,
+		});
 	};
 
 	const availableThinkingLevels = async () => {
@@ -1752,6 +1817,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (command === "workspace") return chooseWorkspace(rest);
 		if (command === "language" || command === "lang") return rest ? setLocale(rest) : openLanguageSelector();
 		if (command === "status") return openStatus(["refresh", "force"].includes(rest.toLowerCase()));
+		if (command === "accounts" || command === "account") {
+			try { await openAccounts(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); }
+			return;
+		}
 		if (command === "new") {
 			activate();
 			try {

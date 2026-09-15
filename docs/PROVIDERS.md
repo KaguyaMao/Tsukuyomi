@@ -432,7 +432,7 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 | OpenAI Codex（ChatGPT） | OAuth | `chatgpt.com/backend-api/wham/usage` | 主/次速率窗口、额度金、计划类型 |
 | OpenRouter | API Key | `GET https://openrouter.ai/api/v1/key` | 本月用量、上限、剩余额度 |
 | DeepSeek | API Key | `GET https://api.deepseek.com/user/balance` | 余额（含币种） |
-| xAI / Grok | OAuth | `GET https://grok.com/rest/subscriptions` | 订阅套餐等级、状态、计费周期（每周用量池不在此接口，见下） |
+| xAI / Grok | OAuth | `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` 与 `/user?include=subscription` | Grok Build 周期用量、剩余额度、产品用量、订阅等级 |
 | xAI / Grok | API Key | — | **无公开额度接口**，见下 |
 | 其它（含自定义与代理） | — | — | 明确返回“无支持的额度接口” |
 
@@ -447,13 +447,12 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 
 ### xAI / Grok 额度说明
 
-xAI **没有**对外提供额度余额 REST 接口（已核对官方文档），但 OAuth 登录后可以读到订阅套餐：
+Grok Build 自身的 `/usage` 界面使用 CLI Chat Proxy 的两个接口，Tsukuyomi 对 OAuth 帐号复用这套接口：
 
-- **订阅套餐（OAuth 可读）**：`GET https://grok.com/rest/subscriptions` 返回当前订阅的等级（如 `grok pro`）、状态（`active`/`inactive`）与计费周期截止时间。`/status` 会用它展示「Plan」一行并注明周期。
-- **每周用量池（不可 API 读取）**：`grok.com/rest/rate-limits` 这个端点确实存在，但 xAI 明确拒绝 OAuth2 令牌访问，返回 `oauth2-auth-forbidden`；它只在 **grok.com 网页端 `Settings → Usage`** 可见。因此 `/status` 会提示「每周用量池仅在网页端显示，API 令牌无法读取」，并给出对应链接。
-- **API Key 账号**：没有消费者订阅，也没有配额接口；速率限制只在**模型调用响应头**中返回（`x-ratelimit-limit-requests`、`x-ratelimit-remaining-requests`、`x-ratelimit-reset-requests`），前端不做模型调用，因此无法主动获取。API 用量在控制台：<https://console.x.ai/usage>。
-
-因此 `/status` 对 xAI 会展示订阅套餐（OAuth）或明确提示「无公开额度接口，请打开下方用量页面查看」（API Key），而不是伪造一个必然失败的请求。
+- `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`：返回当前周期、`creditUsagePercent` 和产品用量。
+- `GET https://cli-chat-proxy.grok.com/v1/user?include=subscription`：返回订阅等级与帐号状态。
+- 两个请求都只发送当前 xAI OAuth Bearer Token；`GROK_CLI_CHAT_PROXY_BASE_URL` 可用于测试或兼容网关覆盖基础地址。
+- API Key 账号仍没有对应消费者额度接口，会提示打开 <https://console.x.ai/usage>。
 
 ### 安全约束
 

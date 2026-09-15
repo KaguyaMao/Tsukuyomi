@@ -235,6 +235,8 @@ try {
 				// is resumed. It owns the pre-login model availability snapshot.
 				workspacePool.remove(launchCwd);
 				args.splice(0, args.length, ...sessionlessArgs(args));
+				if (result.providerId) args.push("--provider", result.providerId);
+				if (result.modelId) args.push("--model", result.modelId);
 				if (result.session) args.push("--session", result.session);
 				continue;
 			}
