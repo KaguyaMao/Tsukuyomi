@@ -75,11 +75,15 @@ export function visibleLength(value) {
 			i = k + 1;
 			continue;
 		}
-		length += charWidth(ch.codePointAt(0));
-		i++;
+		const cp = str.codePointAt(i);
+		length += charWidth(cp);
+		i += cp > 0xffff ? 2 : 1;
 	}
 	return length;
 }
+
+const OSC8_CLOSE = "\x1b]8;;\x1b\\";
+const osc8Open = (url) => `\x1b]8;;${url}\x1b\\`;
 
 /** SGR-aware word wrapping. `text` may contain embedded styling; each emitted
  *  line re-opens the styles active at its start and resets at its end. */
@@ -91,16 +95,18 @@ export function wrapAnsi(text, width, indent = "") {
 	let cur = indent;
 	let curWidth = indentWidth;
 	let active = [];
+	let activeUrl = null;
 	let prefix = "";
 	let hasContent = false;
 
 	const flush = () => {
-		lines.push(prefix + cur + RESET);
+		lines.push(prefix + cur + (activeUrl ? OSC8_CLOSE : "") + RESET);
 		cur = indent;
 		curWidth = indentWidth;
 		// Styles still open at the end of this line are re-opened at the start
-		// of the next line, so wrapped plain text keeps its base colour.
-		prefix = active.join("");
+		// of the next line, so wrapped plain text keeps its base colour (and
+		// bold/italic survive colour changes, hyperlinks stay clickable).
+		prefix = (activeUrl ? osc8Open(activeUrl) : "") + active.join("");
 		hasContent = false;
 	};
 
@@ -113,6 +119,7 @@ export function wrapAnsi(text, width, indent = "") {
 		}
 		if (hasContent && curWidth + token.width > width) flush();
 		updateActive(token.raw, active);
+		activeUrl = updateLink(token.raw, activeUrl);
 		cur += token.raw;
 		curWidth += token.width;
 		hasContent = true;
@@ -157,15 +164,60 @@ function tokenize(text) {
 			i++;
 			continue;
 		}
-		raw += ch;
-		width += charWidth(ch.codePointAt(0));
-		i++;
+		const cp = text.codePointAt(i);
+		raw += String.fromCodePoint(cp);
+		width += charWidth(cp);
+		i += cp > 0xffff ? 2 : 1;
 	}
 	pushWord();
 	return tokens;
 }
 
-/** Track currently-open SGR codes so wrapped continuation lines can reopen. */
+/** Track OSC 8 hyperlink state. Returns the URL active after `raw`
+ *  (null when outside a link). Handles `ESC]8;params;url ST` opens and
+ *  `ESC]8;; ST` closes in order. */
+function updateLink(raw, current) {
+	const re = /\x1b\]8;([^\x1b]*?)\x1b\\/g;
+	let match;
+	let url = current;
+	while ((match = re.exec(raw))) {
+		const content = match[1];
+		// Content is `params;uri` (params usually empty). URI is after the
+		// first semicolon; it may itself contain semicolons.
+		const sep = content.indexOf(";");
+		const uri = sep === -1 ? "" : content.slice(sep + 1);
+		url = uri ? uri : null;
+	}
+	return url;
+}
+
+/** Is this tracked SGR entry a foreground colour? */
+function isFgEntry(entry) {
+	if (entry.startsWith(`${ESC}38`)) return true;
+	return /^\x1b\[(3[0-7]|9[0-7])m$/.test(entry);
+}
+
+/** Is this tracked SGR entry a background colour? */
+function isBgEntry(entry) {
+	if (entry.startsWith(`${ESC}48`)) return true;
+	return /^\x1b\[(4[0-7]|10[0-7])m$/.test(entry);
+}
+
+function removeFg(active) {
+	for (let index = active.length - 1; index >= 0; index--) {
+		if (isFgEntry(active[index])) active.splice(index, 1);
+	}
+}
+
+function removeBg(active) {
+	for (let index = active.length - 1; index >= 0; index--) {
+		if (isBgEntry(active[index])) active.splice(index, 1);
+	}
+}
+
+/** Track currently-open SGR codes so wrapped continuation lines can reopen.
+ *  Colours replace only colours (bold/italic/underline survive colour
+ *  changes); a reset clears everything. */
 function updateActive(raw, active) {
 	const re = /\x1b\[([0-9;]*)m/g;
 	let match;
@@ -184,11 +236,32 @@ function updateActive(raw, active) {
 			else if (code === 38 || code === 48) {
 				// Extended colour (38/48;2;r;g;b or 38/48;5;n). The whole escape
 				// sequence re-applies everything it carries, so skip its params.
-				active.length = 0;
+				// Only the corresponding layer is replaced; decorations stay.
+				if (code === 38) removeFg(active);
+				else removeBg(active);
 				active.push(match[0]);
 				break;
-			} else if ((code >= 30 && code <= 49) || code === 0) {
+			} else if (code === 39) {
+				removeFg(active);
+			} else if (code === 49) {
+				removeBg(active);
+			} else if (
+				(code >= 30 && code <= 37) ||
+				(code >= 90 && code <= 97)
+			) {
+				removeFg(active);
+				active.push(`${ESC}${code}m`);
+			} else if (
+				(code >= 40 && code <= 47) ||
+				(code >= 100 && code <= 107)
+			) {
+				removeBg(active);
+				active.push(`${ESC}${code}m`);
+			} else if (code === 0) {
 				active.length = 0;
+			} else if (code === 1 || code === 3 || code === 4 || code === 9) {
+				const seq = `${ESC}${code}m`;
+				if (!active.includes(seq)) active.push(seq);
 			} else {
 				active.push(`${ESC}${code}m`);
 			}
@@ -246,27 +319,33 @@ function inlineToAnsi(input, base = BASE) {
 		}
 
 		// Image (render alt text, drop the binary reference).
+		// Supports balanced parens in the URL, e.g. `![a](https://x/f(o))`.
 		if (ch === "!" && input[i + 1] === "[") {
-			const end = input.indexOf("]", i + 1);
-			const after = end !== -1 ? input.indexOf(")", end + 1) : -1;
-			if (end !== -1 && after !== -1) {
-				const alt = input.slice(i + 2, end);
-				out += `${fg(PAL.muted)}[${alt}]${close()}`;
-				i = after + 1;
-				continue;
+			const end = input.indexOf("]", i + 2);
+			if (end !== -1 && input[end + 1] === "(") {
+				const urlEnd = findLinkClose(input, end + 2);
+				if (urlEnd !== -1) {
+					const alt = input.slice(i + 2, end);
+					out += `${fg(PAL.muted)}[${alt}]${close()}`;
+					i = urlEnd + 1;
+					continue;
+				}
 			}
 		}
 
 		// Link [text](url) or autolink <url>.
+		// Supports balanced parens in the URL, e.g. Wikipedia `/wiki/PC_(DOS)`.
 		if (ch === "[") {
 			const end = input.indexOf("]", i + 1);
-			const after = end !== -1 ? input.indexOf(")", end + 1) : -1;
-			if (end !== -1 && after !== -1) {
-				const text = input.slice(i + 1, end);
-				const url = input.slice(end + 2, after);
-				out += emitLink(url, text, base);
-				i = after + 1;
-				continue;
+			if (end !== -1 && input[end + 1] === "(") {
+				const urlEnd = findLinkClose(input, end + 2);
+				if (urlEnd !== -1) {
+					const text = input.slice(i + 1, end);
+					const url = input.slice(end + 2, urlEnd);
+					out += emitLink(url, text, base);
+					i = urlEnd + 1;
+					continue;
+				}
 			}
 		}
 		if (ch === "<" && /https?:\/\//.test(rest().slice(1, 9))) {
@@ -330,11 +409,13 @@ function inlineToAnsi(input, base = BASE) {
 			}
 		}
 
-		// Bare URL.
+		// Bare URL (trailing punctuation like `,`/`.`/`!` is not part of it;
+		// a trailing `)`/`]`/`}` only counts when balanced).
 		const bare = /^(https?:\/\/[^\s<]+)/.exec(rest());
 		if (bare) {
-			out += emitLink(bare[1], bare[1], base);
-			i += bare[0].length;
+			const trimmed = trimBareUrl(bare[1]);
+			out += emitLink(trimmed, trimmed, base);
+			i += trimmed.length;
 			continue;
 		}
 
@@ -349,6 +430,54 @@ function emitLink(url, text, base) {
 	const open = `\x1b]8;;${safeUrl}\x1b\\`;
 	const close = `\x1b]8;;\x1b\\`;
 	return `${open}${UNDERLINE}${fg(PAL.accent)}${text}${RESET}${close}${base}`;
+}
+
+/** Find the `)` closing a `(url)` link destination that starts at `open`
+ *  (the index just after the opening `(`). Handles balanced `()` pairs so
+ *  URLs like `https://en.wikipedia.org/wiki/PC_(DOS)` work. Returns -1. */
+function findLinkClose(input, open) {
+	let depth = 0;
+	for (let k = open; k < input.length; k++) {
+		const c = input[k];
+		if (c === "\\" && k + 1 < input.length) {
+			k++;
+			continue;
+		}
+		if (c === "(") depth++;
+		else if (c === ")") {
+			if (depth === 0) return k;
+			depth--;
+		}
+		else if (c === " " || c === "\n" || c === "\t") {
+			// Link destinations must not contain unescaped whitespace
+			// (titles like `[t](u "title")` are out of scope: stop here).
+			return -1;
+		}
+	}
+	return -1;
+}
+
+/** Strip trailing punctuation from a bare-URL match. Keeps balanced
+ *  closers (`)`/`]`/`}`) only when they balance an opener inside the URL. */
+function trimBareUrl(url) {
+	let end = url.length;
+	// Closing brackets: drop surplus closers that have no opener.
+	for (const [open, close] of [["(", ")"], ["[", "]"], ["{", "}"]]) {
+		while (end > 0 && url[end - 1] === close) {
+			const slice = url.slice(0, end);
+			let opens = 0;
+			let closes = 0;
+			for (const c of slice) {
+				if (c === open) opens++;
+				else if (c === close) closes++;
+			}
+			if (closes > opens) end--;
+			else break;
+		}
+	}
+	// Sentence punctuation and quotes are never part of the URL.
+	while (end > 0 && `.,;:!?'"*`.includes(url[end - 1])) end--;
+	return url.slice(0, end) || url;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -440,6 +569,21 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 			continue;
 		}
 
+		// Indented code block (4 spaces or a tab). Cannot interrupt a
+		// paragraph: here we are always at a block boundary because paragraph
+		// lines are consumed greedily below, so any indented run is code.
+		if (/^(?: {4}|\t)/.test(line)) {
+			const body = [];
+			while (i < lines.length && /^(?: {4}|\t)/.test(lines[i])) {
+				body.push(lines[i].replace(/^(?: {4}|\t)/, "").replace(/\t/g, "  "));
+				i++;
+			}
+			// Trailing blank-adjacent runs of only whitespace are not code;
+			// the loop above already stops at blank lines.
+			pushBlock(renderCodeBlock(body, "", width));
+			continue;
+		}
+
 		// Paragraph: gather consecutive non-blank, non-block lines.
 		const para = [];
 		while (i < lines.length && lines[i].trim() && !startsBlock(lines[i], lines[i + 1])) {
@@ -479,7 +623,21 @@ function parseList(lines, startIndex) {
 	while (i < lines.length) {
 		const line = lines[i];
 		const m = /^( *)([-*+]|\d+[.)])[ \t]+(.*)$/.exec(line);
-		if (!m) break;
+		if (!m) {
+			// Indented continuation line belongs to the previous item
+			// (e.g. a wrapped description without a new marker).
+			if (
+				items.length > 0 &&
+				line.trim() !== "" &&
+				/^[ \t]+/.test(line) &&
+				!startsBlock(line.trimStart(), lines[i + 1])
+			) {
+				items[items.length - 1].text += ` ${line.trim()}`;
+				i++;
+				continue;
+			}
+			break;
+		}
 		const indent = m[1].length;
 		const markerToken = m[2];
 		const body = m[3];
@@ -529,7 +687,30 @@ function renderList(items, width) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function parseTable(lines, startIndex) {
-	const splitRow = (raw) => raw.replace(/^\s*\|?/, "").replace(/\|?\s*$/, "").split("|").map((cell) => cell.trim());
+	// Split on unescaped `|` so `\|` stays inside the cell.
+	const splitRow = (raw) => {
+		let s = String(raw).trim();
+		if (s.startsWith("|")) s = s.slice(1);
+		if (s.endsWith("|")) s = s.slice(0, -1);
+		const cells = [];
+		let cur = "";
+		for (let k = 0; k < s.length; k++) {
+			const c = s[k];
+			if (c === "\\" && k + 1 < s.length && (s[k + 1] === "|" || s[k + 1] === "\\")) {
+				cur += s[k + 1];
+				k++;
+				continue;
+			}
+			if (c === "|") {
+				cells.push(cur.trim());
+				cur = "";
+				continue;
+			}
+			cur += c;
+		}
+		cells.push(cur.trim());
+		return cells;
+	};
 	const header = splitRow(lines[startIndex]);
 	const aligns = splitRow(lines[startIndex + 1]).map((cell) => {
 		const left = cell.startsWith(":");
@@ -583,7 +764,9 @@ function renderTable(table, width) {
 	};
 
 	const renderRow = (cells) => {
-		const colLines = cells.map((cell, index) => padCell(cell, index));
+		const padded = [...cells];
+		while (padded.length < columns) padded.push("");
+		const colLines = padded.map((cell, index) => padCell(cell, index));
 		const rowHeight = Math.max(1, ...colLines.map((lines) => lines.length));
 		const out = [];
 		for (let r = 0; r < rowHeight; r++) {
@@ -629,7 +812,9 @@ function renderSeparator(widths, left, mid, right) {
 function renderCodeBlock(lines, lang, width) {
 	const rows = [];
 	const label = lang ? `${fg(PAL.secondary)}${lang}${RESET}` : "";
-	rows.push(`${fg(PAL.border)}──${label ? ` ${label}` : ""}${"─".repeat(Math.max(0, width - 4 - visibleLength(label)))}${RESET}`);
+	const labelWidth = visibleLength(label);
+	const topDashes = Math.max(0, width - 2 - (label ? 1 + labelWidth : 0));
+	rows.push(`${fg(PAL.border)}──${label ? ` ${label}` : ""}${"─".repeat(topDashes)}${RESET}`);
 	for (const line of lines) {
 		const hl = highlight(line, lang);
 		rows.push(`${fg(PAL.border)}│${RESET} ${hl}${RESET}`);
@@ -841,6 +1026,15 @@ function highlightBash(code) {
 			i = end + 1;
 			continue;
 		}
+		// $VAR / $1 / $? / $# — highlight the whole variable.
+		if (ch === "$" && /[A-Za-z_0-9?#$!*]/.test(code[i + 1] || "")) {
+			const m = /^\$[A-Za-z_][\w]*|^\$[0-9?#$!*]/.exec(code.slice(i));
+			if (m) {
+				out += `${HL.func}${m[0]}${RESET}`;
+				i += m[0].length;
+				continue;
+			}
+		}
 		if (ch === "-" && /[A-Za-z]/.test(code[i + 1] || "")) {
 			const m = /^--?[A-Za-z][\w-]*/.exec(code.slice(i));
 			out += `${HL.keyword}${m[0]}${RESET}`;
@@ -973,6 +1167,7 @@ export const inlineAnsi = (text, base = BASE) => inlineToAnsi(text, base);
 /** Map a file path's extension to a highlighter language id. */
 export function langFromPath(path) {
 	if (!path || typeof path !== "string") return undefined;
+	const base = path.slice(path.lastIndexOf("/") + 1);
 	const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 	const map = {
 		js: "js", mjs: "js", cjs: "js", jsx: "js", ts: "ts", tsx: "ts", json: "json",
@@ -981,6 +1176,11 @@ export function langFromPath(path) {
 		sh: "bash", bash: "bash", zsh: "bash", yml: "yaml", yaml: "yaml", toml: "yaml",
 		xml: "xml", html: "xml", htm: "xml", svg: "xml", css: "css", sql: "sql",
 		md: "markdown", markdown: "markdown",
+		bashrc: "bash", zshrc: "bash",
 	};
-	return map[ext];
+	if (map[ext]) return map[ext];
+	// Dotfiles like `.bashrc` / `.zshrc` have no "real" extension.
+	const dotless = base.startsWith(".") ? base.slice(1).toLowerCase() : "";
+	if (dotless && map[dotless]) return map[dotless];
+	return undefined;
 }
