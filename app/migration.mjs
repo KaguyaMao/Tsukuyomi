@@ -244,7 +244,7 @@ export function migrate({ target, sources = [], appRoot, dryRun = false }) {
 		}
 		if (report.errors.length) throw new Error(`Migration incomplete: ${report.errors.map((item) => `${item.path}: ${item.error}`).join("; ")}`);
 		if (!dryRun) {
-			for (const directory of ["sessions", "extensions", "themes"]) mkdirSync(join(target, directory), { recursive: true, mode: 0o700 });
+			for (const directory of ["sessions", "extensions", "skills", "themes"]) mkdirSync(join(target, directory), { recursive: true, mode: 0o700 });
 			atomic(join(target, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`);
 			saveLedger(); atomic(join(metadata, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
 		}

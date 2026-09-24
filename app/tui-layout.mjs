@@ -57,6 +57,7 @@ export function computeAgentLayout({
 	width,
 	height,
 	promptHeight,
+	statusHeight = 1,
 	dockHeight = 0,
 	turnStatusHeight = 0,
 	shortcutsHeight = 1,
@@ -75,8 +76,8 @@ export function computeAgentLayout({
 		Math.max(1, rows - topPadding - bottomPadding),
 	);
 
-	let status = inner.height > 0 ? 1 : 0;
-	let statusGap = compact ? 0 : 1;
+	let status = inner.height > 0 && integer(statusHeight, 1) > 0 ? 1 : 0;
+	let statusGap = status && !compact ? 1 : 0;
 	let prompt = clamp(integer(promptHeight, 3), 1, 13);
 	let turnStatus = integer(turnStatusHeight) > 0 ? 1 : 0;
 	let turnGap = turnStatus && !compact ? 1 : 0;

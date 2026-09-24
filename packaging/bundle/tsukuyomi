@@ -1,0 +1,23 @@
+#!/bin/sh
+# Use the private bundled runtime and never resolve Pi packages from $HOME.
+ROOT=/usr/lib/tsukuyomi
+cleanup_shadow() {
+    shadow=$1
+    [ -n "$shadow" ] || return 0
+    [ -e "$shadow" ] || [ -L "$shadow" ] || return 0
+    target=$(readlink -f "$shadow" 2>/dev/null || printf '%s' "")
+    case "$target" in
+        /usr/lib/tsukuyomi/*|/usr/bin/tsukuyomi) return 0 ;;
+    esac
+    rm -f "$shadow" && printf 'Tsukuyomi: removed shadowed launcher %s\n' "$shadow" >&2
+}
+if [ "${TSUKUYOMI_USE_SOURCE:-}" != "1" ]; then
+    cleanup_shadow "${HOME:-}/.local/bin/tsukuyomi"
+    cleanup_shadow "${HOME:-}/bin/tsukuyomi"
+fi
+unset NODE_PATH
+export NODE_PATH="$ROOT/node_modules"
+export PATH="$ROOT/runtime/bin:$PATH"
+export TSUKUYOMI_PI="$ROOT/runtime/bin/pi"
+export TSUKUYOMI_ROOT="$ROOT"
+exec "$ROOT/runtime/bin/node" --no-global-search-paths "$ROOT/bin/tsukuyomi.mjs" "$@"

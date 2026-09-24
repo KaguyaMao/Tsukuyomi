@@ -332,6 +332,10 @@ Tsukuyomi 写入时会把 opencode 插值改写成 PI 语法：
 - **刷新**：OAuth 令牌在请求前自动刷新，刷新在凭据锁内进行，避免并发重复刷新；刷新失败会保留原凭据并要求重新登录。
 - **退出登录**：删除对应供应商的凭据，不影响环境变量与 `models.json` 配置。
 
+### OpenCode 凭据迁移
+
+运行 `tsukuyomi --migrate-opencode` 可把 OpenCode 的 `auth.json` 和已登录供应商对应的自定义配置迁移到 Tsukuyomi。OpenCode 的 `type: "api"` 会转换为 PI 的 `type: "api_key"`；OpenAI OAuth 会写入 PI 使用的 `openai-codex`。迁移会更新 `auth.json`、账户索引和相关 `models.json` 配置，不会修改 OpenCode 源文件。可先使用 `--dry-run`，或用 `--opencode-auth <file>` 与 `--opencode-config <file>` 指定来源。
+
 ## 9. 改名与迁移（kaguyapi → Tsukuyomi）
 
 | 项目 | 旧 | 新 |
@@ -344,7 +348,7 @@ Tsukuyomi 写入时会把 opencode 插值改写成 PI 语法：
 | 网络工具配置 | `kaguya-web.json` | `tsukuyomi-web.json` |
 
 - 首次以 `tsukuyomi` 启动时，会从 `~/.pi/agent` 与 `~/.kaguyapi/agent` 执行**一次性迁移**：复制凭据、供应商、会话，并把上述旧文件名重命名为新名字。源目录**不会被修改**。
-- 旧环境变量在过渡期内仍被识别（`KAGUYAPI_DIR`、`KAGUYAPI_PI`、`KAGUYAPI_LANG`、`KAGUYAPI_STATUS_URL`、`KAGUYAPI_WEBSEARCH_*`、`KAGUYAPI_TASK_SOCKET` 等）。
+- 旧环境变量在过渡期内仍被识别；`KAGUYAPI_DIR` 只作为迁移源，不会成为 Tsukuyomi 的运行时配置根目录。
 - 仍可使用 `kaguyapi` 命令：它只是一个转发外壳，会打印一行弃用提示（`TSUKUYOMI_QUIET_RENAME=1` 可静默），然后执行 `tsukuyomi`。新安装可删除 `bin/kaguyapi.mjs` 及 `package.json` 中的 `kaguyapi` bin 以彻底移除别名。
 
 ## 10. 安全
@@ -383,12 +387,13 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 
 原因：Node 的原生 `fetch`（undici）默认**不读取** `HTTP_PROXY` / `HTTPS_PROXY`（除非用 `--use-env-proxy` 启动，且该选项对旧版 Node 不可用），而 OpenAI 还会拒绝数据中心 IP 的 TLS 指纹返回 `403 unsupported_country_region_territory`。因此：
 
-1. `app/net-env.mjs` 在启动时从 `.env` 读取代理（顺序：`<agent>/.env` → `~/.tsukuyomi` → `~/.kaguyapi` → `~/.pi` → `~/.codex`），并**不覆盖**你已显式导出的变量。
-2. 若检测到代理且未启用 `NODE_USE_ENV_PROXY`，Tsukuyomi 会**自动重启一次**并带上该变量（`TSUKUYOMI_NET_PROXY_EXEC=1` 防止循环），使所有原生 fetch 都走代理。旧版 Node 忽略该变量，仍由下面的 curl 兜底。
-3. `app/curl-fetch.cjs` 用 `curl -x <proxy>` 处理登录与额度请求（curl 的 TLS 指纹被接受）。默认只匹配**非流式**端点：`auth.openai.com`、`auth.x.ai`、`chatgpt.com/backend-api/wham/`；**不会**碰 `api.x.ai`、`…/backend-api/codex/*` 等流式请求，避免破坏逐字输出。
-4. `app/http.mjs` 的 `createProxyAwareFetch()` 保留原生 fetch 为快路径，仅在连接类失败且已配置代理时用 curl 重试。
+1. `app/net-env.mjs` 在启动时从 `.env` 读取代理（顺序：`<agent>/.env` → `~/.tsukuyomi/agent/.env` → `~/.codex/.env`），并**不覆盖**你已显式导出的变量。旧 Pi/Kaguya `.env` 只会在迁移时复制到 canonical root。
+2. 应用代理前会先做一次 **TCP 连通性探测**：若代理端口拒绝连接（例如你已经关闭本地代理客户端），则丢弃所有代理变量，前端与 PI 内核都改为**直连**。这样 `api.deepseek.com` 等国内可直连的供应商不会因为一个失效的代理而报 connection error。`TSUKUYOMI_PROXY_PROBE=0` 可关闭该探测、恢复“只要配置了就一律走代理”；`TSUKUYOMI_PROXY_PROBE_TIMEOUT_MS` 可调整探测超时（默认 600ms）。
+3. 若代理可达且未启用 `NODE_USE_ENV_PROXY`，Tsukuyomi 会**自动重启一次**并带上该变量（`TSUKUYOMI_NET_PROXY_EXEC=1` 防止循环），使所有原生 fetch 都走代理。旧版 Node 忽略该变量，仍由下面的 curl 兜底。
+4. `app/curl-fetch.cjs` 用 `curl -x <proxy>` 处理登录与额度请求（curl 的 TLS 指纹被接受）。默认只匹配**非流式**端点：`auth.openai.com`、`auth.x.ai`、`chatgpt.com/backend-api/wham/`；**不会**碰 `api.x.ai`、`…/backend-api/codex/*` 等流式请求，避免破坏逐字输出。
+5. `app/http.mjs` 的 `createProxyAwareFetch()` 保留原生 fetch 为快路径，仅在连接类失败且已配置代理时用 curl 重试。
 
-> 注意：代理变量只影响登录、额度与发现；模型推理由 PI 内核发起，内核会继承同样的代理设置。若某供应商的 API 主机在你的网络只能走代理，请确认代理进程正常运行。
+> 注意：代理变量只影响登录、额度与发现；模型推理由 PI 内核发起，内核会继承同样的代理设置（代理不可达时会连同内核一起改为直连）。若某供应商的 API 主机在你的网络只能走代理，请确认代理进程正常运行。
 
 相关变量：
 
@@ -402,6 +407,8 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 | `TSUKUYOMI_CURL_FETCH_MATCH` | 替换默认匹配规则（正则） |
 | `TSUKUYOMI_CURL_FETCH_EXTRA` | 在默认规则上追加一条（正则） |
 | `TSUKUYOMI_CURL_FETCH_DEBUG=1` | 打印每个被 curl 接管/放行的 URL |
+| `TSUKUYOMI_PROXY_PROBE=0` | 关闭代理连通性探测，配置了代理就一律使用 |
+| `TSUKUYOMI_PROXY_PROBE_TIMEOUT_MS` | 代理探测的 TCP 超时（毫秒，默认 600） |
 
 ## 13. 故障排查补充
 
@@ -409,6 +416,7 @@ Tsukuyomi 有三个需要联网的位置，且都在**前端进程**内发起：
 | --- | --- |
 | `/status` 显示 `fetch failed` / “额度接口直连与代理均不可达” | 配额端点直连不可达，且代理重试也失败。确认代理进程在跑（默认 `127.0.0.1:12450`）、`HTTP_PROXY` 或 `TSUKUYOMI_CURL_PROXY` 正确；用 `TSUKUYOMI_CURL_FETCH_DEBUG=1 tsukuyomi` 观察是否被 curl 接管。 |
 | 登录后仍被判“该地区不支持” | 钩子未生效。检查 `app/curl-fetch.cjs` 是否存在、`NODE_OPTIONS` 是否被注入（启动日志无 “could not install the curl-fetch hook”）。 |
+| 关闭代理后 DeepSeek 等国内供应商 connection error | 某个 `.env`（常见为 `~/.codex/.env`）仍配置着已关闭的代理。Tsukuyomi 现在会探测并自动直连；若仍失败，检查是否有显式 shell 代理变量（`env \| grep -i proxy`）或设置了 `TSUKUYOMI_PROXY_PROBE=0`。 |
 | 模型输出卡住不动 | 钩子匹配范围被改得太宽，把流式端点也接管了。默认规则不含 `…/backend-api/codex/*`；如自定义了 `TSUKUYOMI_CURL_FETCH_MATCH`，请排除流式路径。 |
 | 自定义供应商“模型发现失败” | 端点或密钥问题；若端点仅代理可达，会自动重试，仍失败则为端点返回异常。 |
 

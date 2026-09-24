@@ -1,0 +1,4 @@
+summary	Team objective	Review · executing · leader · usage — · revive — · parked — · advisor —
+member	● Ada	builder · build · git-worktree · running · usage — · revive — · parked — · advisor —
+task	○ subagent · npm test	done · — · Patch available · usage — · revive — · parked — · advisor —
+agent	Reviewer	pi/test · 

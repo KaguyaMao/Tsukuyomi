@@ -206,7 +206,14 @@ export function syncHistoryCache(cache, ctx) {
 	const layoutKey = ctx.layoutKey;
 	const omitUserIndex = ctx.omitUserIndex ?? -1;
 	const thinkingKey = thinkingCacheKey(ctx.thinkingAutoCollapse, ctx.thinkingExpanded);
-	const lastAssistantIndex = messages.findLastIndex((message) => message?.role === "assistant");
+	// The live path appends finalized messages in place, so array identity alone
+	// is not enough to reuse the last-assistant scan: a length change means new
+	// history must be laid out. Reusing the index otherwise keeps the per-frame
+	// cost off the O(history) path.
+	const sameSource = cache.source === messages && cache.sourceLength === messages.length;
+	const lastAssistantIndex = sameSource
+		? cache.lastAssistantIndex
+		: messages.findLastIndex((message) => message?.role === "assistant");
 	cache.rendered = 0;
 	cache.reused = 0;
 	cache.didAssemble = false;
@@ -247,9 +254,9 @@ export function syncHistoryCache(cache, ctx) {
 		}
 	}
 
-	const sameSource = cache.source === messages;
 	const sameThinking = cache.thinkingKey === thinkingKey;
 	cache.source = messages;
+	cache.sourceLength = messages.length;
 	cache.thinkingKey = thinkingKey;
 
 	const canPartial = sameSource && !layoutChanged && sameThinking && cache.entries.size > 0;

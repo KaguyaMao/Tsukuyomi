@@ -1,0 +1,4 @@
+FROM docker.io/library/rockylinux:8-minimal
+RUN microdnf -y install gcc-c++ make python39 \
+    && microdnf clean all
+ENV PYTHON=/usr/bin/python3.9

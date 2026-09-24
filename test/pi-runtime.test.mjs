@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { findPi, findPiRoot, resolvePiTui } from "../app/pi-runtime.mjs";
+import { bundledPiEntry, bundledPiRoot, findPi, findPiRoot, resolvePiTui } from "../app/pi-runtime.mjs";
 
 function writeFile(path, content) {
 	mkdirSync(dirname(path), { recursive: true });
@@ -66,4 +66,30 @@ test("findPi prefers an explicit TSUKUYOMI_PI over PATH", () => {
 		if (previous === undefined) delete process.env.TSUKUYOMI_PI;
 		else process.env.TSUKUYOMI_PI = previous;
 	}
+});
+
+test("findPi uses the kernel bundled with the tsukuyomi package", () => {
+	const entry = bundledPiEntry();
+	assert.ok(entry && existsSync(entry), "the bundled kernel entry should exist");
+	assert.match(entry, /pi-coding-agent[/\\]dist[/\\]bundle[/\\]cli\.js$/);
+	const previousPi = process.env.TSUKUYOMI_PI;
+	const previousPath = process.env.PATH;
+	delete process.env.TSUKUYOMI_PI;
+	process.env.PATH = "";
+	try {
+		// No global `pi` on PATH: the bundled dependency must still resolve.
+		assert.equal(findPi({ root: join(tmpdir(), "tsukuyomi-missing"), home: join(tmpdir(), "tsukuyomi-missing") }), entry);
+	} finally {
+		if (previousPi === undefined) delete process.env.TSUKUYOMI_PI;
+		else process.env.TSUKUYOMI_PI = previousPi;
+		process.env.PATH = previousPath;
+	}
+});
+
+test("findPiRoot and resolvePiTui resolve the bundled kernel tree", () => {
+	const entry = bundledPiEntry();
+	const root = bundledPiRoot();
+	assert.ok(entry && root);
+	assert.equal(findPiRoot(entry, { appRoot: root }), root);
+	assert.ok(existsSync(resolvePiTui({ appRoot: root, piRoot: root })));
 });

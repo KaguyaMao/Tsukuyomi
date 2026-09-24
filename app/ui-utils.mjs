@@ -1,3 +1,5 @@
+import { redactText } from "./redact.mjs";
+
 const CURSOR_HIGHLIGHT_RE = /\x1b\[7m([\s\S]*?)\x1b\[0m/;
 const SGR_SEQUENCE = /\x1b\[[0-?]*[ -/]*m/g;
 const SGR_SEQUENCE_TEST = /^\x1b\[[0-?]*[ -/]*m$/;
@@ -62,6 +64,26 @@ export function sanitizeTerminalText(value) {
 		.replace(/\x1b/g, "")
 		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f]/g, "")
 		.replace(/\uE000(\d+)\uE001/g, (_match, index) => sgr[Number(index)] || "");
+}
+
+/** Plain text of a message's content array (or a raw string). */
+function contentText(content) {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.filter((part) => part?.type === "text").map((part) => part.text || "").join("\n");
+}
+
+/**
+ * Human-readable error carried by a finalized assistant turn, or undefined for a
+ * normal/aborted turn. Provider failures (`stopReason: "error"`) leave an empty
+ * transcript block, so the TUI uses this for both the inline row and the toast.
+ */
+export function assistantErrorMessage(message) {
+	if (!message || message.role !== "assistant" || message.stopReason === "aborted") return undefined;
+	const explicit = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+	if (message.stopReason !== "error" && !explicit) return undefined;
+	const text = sanitizeTerminalText(redactText(explicit || contentText(message.content))).replace(/\s+/g, " ").trim();
+	return text || undefined;
 }
 
 /**

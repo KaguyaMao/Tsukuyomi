@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export function registerLsp(pi: ExtensionAPI) {
 	let manager: LspManager;
-	const get = (cwd: string) => manager ||= new LspManager(cwd, process.env.PI_CODING_AGENT_DIR || cwd);
+	const get = (cwd: string) => manager ||= new LspManager(cwd, process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR || cwd);
 	pi.registerTool({ name: "lsp", label: "LSP", description: "Code intelligence: status, diagnostics, definition, references, hover, symbols, workspace_symbols, rename, format, code_actions. Positions are 1-based UTF-16. Mutating operations return a preview token; apply:true with that token applies exactly the preview after checking file versions.",
 		parameters: Type.Object({ action: Type.String(), file: Type.Optional(Type.String()), line: Type.Optional(Type.Number()), column: Type.Optional(Type.Number()), query: Type.Optional(Type.String()), newName: Type.Optional(Type.String()), apply: Type.Optional(Type.Boolean()), token: Type.Optional(Type.String()) }),
 		async execute(_id, params, signal, _update, ctx) { const result = await get(ctx.cwd).execute(params, signal); return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result }; },

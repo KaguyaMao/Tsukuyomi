@@ -1,0 +1,4 @@
+{"columns":40,"minimal":false,"paddingX":2,"chromeWidth":3,"contentWidth":34,"statusAvailable":34}
+{"columns":80,"minimal":false,"paddingX":2,"chromeWidth":3,"contentWidth":74,"statusAvailable":74}
+{"columns":120,"minimal":false,"paddingX":2,"chromeWidth":3,"contentWidth":114,"statusAvailable":114}
+{"columns":160,"minimal":false,"paddingX":2,"chromeWidth":3,"contentWidth":154,"statusAvailable":154}

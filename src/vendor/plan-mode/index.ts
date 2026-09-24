@@ -17,6 +17,8 @@ import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.ts";
+import { structuredSelect } from "../../structured-ui.ts";
+import { decodeOverlayResult } from "../../../app/tui/overlay-result.mjs";
 
 // Tools
 const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "questionnaire"];
@@ -49,6 +51,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let executionMode = false;
 	let todoItems: TodoItem[] = [];
 	let toolsBeforePlanMode: string[] | undefined;
+	let reviewGeneration = 0;
+	let reviewPending = false;
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only exploration)",
@@ -123,6 +127,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	function togglePlanMode(ctx: ExtensionContext): void {
+		reviewGeneration++;
 		planModeEnabled = !planModeEnabled;
 		executionMode = false;
 		todoItems = [];
@@ -211,17 +216,27 @@ Restrictions:
 - Other currently active tools remain available
 - Bash is restricted to an allowlist of read-only commands
 
-Ask clarifying questions using the questionnaire tool.
-Use brave-search skill via bash for web research.
+Behave like Codex plan mode:
+- First inspect enough context to separate facts from assumptions.
+- Ask the user only when an unresolved choice would materially change scope, architecture, safety, or acceptance criteria.
+- Use the questionnaire tool for at most 3 focused questions at a time. Offer 2–4 mutually exclusive options, put the recommended option first, and explain each tradeoff briefly. Do not ask questions answerable from the workspace.
+- If the request is already well-specified, do not ask a ceremonial question.
+- Use web_search/web_fetch for current public research when available; do not mutate the workspace.
 
-Create a detailed numbered plan under a "Plan:" header:
+Then produce an implementation-ready response under exactly these headings:
+
+Summary:
+- Goal, relevant constraints, and explicit assumptions.
 
 Plan:
-1. First step description
-2. Second step description
+1. Ordered implementation step with concrete files/components and validation.
+2. Next step.
 ...
 
-Do NOT attempt to make changes - just describe what you would do.`,
+Validation:
+- Tests, checks, and user-visible acceptance criteria.
+
+Do NOT attempt to make changes. Do not claim uncertain details as facts. End after the plan and wait for the user's explicit approval before execution.`,
 					display: false,
 				},
 			};
@@ -276,7 +291,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
 			return;
 		}
 
-		if (!planModeEnabled || !ctx.hasUI) return;
+		if (!planModeEnabled || !ctx.hasUI || reviewPending) return;
 
 		// Extract todos from last assistant message
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
@@ -298,16 +313,28 @@ After completing a step, include a [DONE:n] tag in your response.`,
 			display: true,
 		};
 
-		const choice = await ctx.ui.select("Plan mode - what next?", [
-			"Execute the plan (track progress)",
-			"Stay in plan mode",
-			"Refine the plan",
-		]);
+		const generation = reviewGeneration;
+		reviewPending = true;
+		let choice: string | undefined;
+		try {
+			choice = await structuredSelect(ctx, "plan-review", "Plan mode - what next?", [
+				"Execute the plan (track progress)",
+				"Stay in plan mode",
+				"Refine the plan",
+			], { body: (lastAssistant ? getTextContent(lastAssistant) : "") || todoListText, steps: todoItems.map((item) => item.text) });
+		} finally { reviewPending = false; }
+		const decoded = decodeOverlayResult(choice, ["Execute the plan (track progress)", "Stay in plan mode", "Refine the plan"]);
+		choice = decoded.choice;
+		const reviewExtra = decoded.extra;
+		if (typeof reviewExtra?.slider === "string") { try { pi.setThinkingLevel(reviewExtra.slider as never); } catch { /* ignore unavailable level */ } }
+		// The user may have switched modes or sessions while the dialog was open.
+		if (generation !== reviewGeneration || !planModeEnabled) return;
 
 		if (choice?.startsWith("Execute")) {
 			const firstTodoItem = todoItems[0];
 			if (!firstTodoItem) return;
 
+			reviewGeneration++;
 			planModeEnabled = false;
 			executionMode = true;
 			restoreNormalModeTools();
@@ -321,14 +348,15 @@ Remaining steps:
 ${remainingList}
 
 Start with: ${firstTodoItem.text}
-After completing a step, include a [DONE:n] tag in your response.`;
+After completing a step, include a [DONE:n] tag in your response.${reviewExtra?.planText ? `\n\nEdited plan:\n${reviewExtra.planText}` : ""}${reviewExtra?.feedback ? `\n\n${reviewExtra.feedback}` : ""}`;
 			pi.sendMessage(planTodoListMessage, { deliverAs: "followUp" });
 			pi.sendMessage(
 				{ customType: "plan-mode-execute", content: execMessage, display: true },
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
 		} else if (choice === "Refine the plan") {
-			const refinement = await ctx.ui.editor("Refine the plan:", "");
+			const refinement = await ctx.ui.editor("Refine the plan:", [reviewExtra?.feedback, reviewExtra?.planText].filter(Boolean).join("\n\n"));
+			if (generation !== reviewGeneration || !planModeEnabled) return;
 			if (refinement?.trim()) {
 				pi.sendMessage(planTodoListMessage, { deliverAs: "followUp" });
 				pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
@@ -338,6 +366,7 @@ After completing a step, include a [DONE:n] tag in your response.`;
 
 	// Restore state on session start/resume
 	pi.on("session_start", async (_event, ctx) => {
+		reviewGeneration++;
 		if (pi.getFlag("plan") === true) {
 			planModeEnabled = true;
 		}

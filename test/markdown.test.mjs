@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	renderMarkdown,
+	renderOutputBlock,
+	renderStreamingCodeBlock,
 	highlight,
 	inlineAnsi,
 	langFromPath,
@@ -160,6 +162,35 @@ test("fenced code blocks render a border, language label and highlight", () => {
 	assert.ok(joined.includes("const"), "code content present");
 	// The keyword `const` should be highlighted.
 	assert.ok(joined.includes(BOLD) || joined.includes(ESC), "some SGR present");
+	assert.ok(stripAnsi(rows[0]).startsWith("╭"), "standalone rounded frame starts the block");
+	assert.ok(stripAnsi(rows.at(-1)).startsWith("╰"), "standalone rounded frame closes the block");
+});
+
+test("unfinished streaming fence still renders as a code block", () => {
+	const rows = renderMarkdown("```ts\nconst answer = 42", { width: 40 });
+	assert.equal(stripAnsi(rows[0]).includes("ts"), true);
+	assert.ok(stripAnsi(rows.join("\n")).includes("const answer = 42"));
+});
+
+test("output blocks use semantic state surfaces", () => {
+	const rows = renderOutputBlock({ header: "Bash", state: "running", sections: [{ lines: ["echo ok"] }], width: 30 });
+	assert.match(rows.join("\n"), /48;2;24;38;55m/);
+	assert.equal(stripAnsi(rows[0]).startsWith("╭"), true);
+	assert.equal(stripAnsi(rows.at(-1)).startsWith("╰"), true);
+});
+
+test("streaming code blocks preserve native highlighting state", () => {
+	const streamState = {};
+	const first = renderStreamingCodeBlock("```ts\nconst answer =", { width: 40, streamState });
+	const second = renderStreamingCodeBlock("```ts\nconst answer = 42\nreturn answer", { width: 40, streamState });
+	assert.ok(first && second);
+	assert.match(stripAnsi(second.join("\n")), /const answer = 42/);
+	assert.ok(second.every((row) => visibleLength(row) <= 40));
+});
+
+test("mixed content after a closed streaming fence uses full Markdown rendering", () => {
+	const rows = renderStreamingCodeBlock("```js\nconst answer = 42\n```\nAfter", { width: 40, streamState: {} });
+	assert.equal(rows, undefined);
 });
 
 test("code blocks do not wrap long lines", () => {
@@ -167,17 +198,19 @@ test("code blocks do not wrap long lines", () => {
 	const md = "```\n" + longLine + "\n```";
 	const rows = renderMarkdown(md, { width: 40 });
 	const codeRow = rows.find((row) => stripAnsi(row).includes("x"));
-	assert.ok(codeRow && visibleLength(codeRow) > 40, "code line exceeds wrap width");
+	assert.ok(codeRow && visibleLength(codeRow) <= 40, "code line stays within the output frame");
 });
 
 test("highlight decorates JavaScript keywords and strings", () => {
 	const out = highlight('const x = "hi";', "js");
 	// Keyword `const` and string "hi" are each wrapped in their own SGR span.
-	assert.ok(out.includes(RESET), "each span resets");
+	assert.ok(out.includes(RESET) || out.includes(`${ESC}39m`), "each span resets its foreground");
 	assert.ok(out.includes(ESC), "emits SGR sequences");
 	const stripped = stripAnsi(out);
 	assert.ok(stripped.includes("const"));
 	assert.ok(stripped.includes('"hi"'));
+	assert.match(out, /38;2;0;180;255m/, "OMP keyword color");
+	assert.match(out, /38;2;212;192;144m/, "OMP string color");
 });
 
 test("highlight handles JSON keys versus strings", () => {
@@ -189,7 +222,7 @@ test("highlight handles JSON keys versus strings", () => {
 
 test("highlight falls back to plain text for unknown languages", () => {
 	const out = highlight("anything at all", "unknowndialect");
-	assert.equal(out, `${ESC}38;2;235;235;235manything at all`);
+	assert.equal(out, `${ESC}38;2;232;236;244manything at all`);
 });
 
 test("highlight covers python, bash and sql without throwing", () => {

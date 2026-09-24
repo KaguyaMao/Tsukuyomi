@@ -5,6 +5,7 @@ import { registerCompactPlugin, type CompactState } from "./compact.ts";
 import { registerPlanBridge } from "./plan-bridge.ts";
 import { registerLsp } from "./lsp.ts";
 import { registerTasks } from "./tasks.ts";
+import { registerAgentTeams } from "./agent-team.ts";
 import { TaskClient } from "../app/task-client.mjs";
 import { TodoStore } from "./todos.ts";
 import { createToolPolicy, type ToolPolicyApi } from "./tool-policy.ts";
@@ -12,6 +13,7 @@ import type { AgentMode } from "./utils.ts";
 import { MODE_LABEL } from "./utils.ts";
 import { registerWebFetch } from "./web_fetch.ts";
 import { registerWebSearch } from "./web_search.ts";
+import { registerQuestionnaire } from "./questionnaire.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -19,6 +21,8 @@ import { removeProviderConfig, saveProviderConfig } from "../app/providers/confi
 import { buildCustomProvider } from "../app/providers/config/discovery.mjs";
 import { removeProviderFromModelsJson, syncProviderToModelsJson, toProviderConfigInput } from "../app/providers/config/sync.mjs";
 import { writeStoredCredential } from "../app/providers/store.mjs";
+import { getAgent, listAgents, deleteAgent } from "../app/agents.mjs";
+import { activateAccount } from "../app/providers/accounts.mjs";
 
 const TodoParams = Type.Object({
 	action: StringEnum(["list", "add", "toggle", "clear"] as const),
@@ -50,12 +54,69 @@ export default function tsukuyomiBackend(pi: ExtensionAPI): void {
 	registerCompactPlugin(pi, compact, publishCompact);
 
 	const modes = registerPlanBridge(pi, policy);
+	const agentDir = process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".tsukuyomi", "agent");
+	let activeAgent: any;
+	const publishAgent = (ctx: ExtensionContext) => {
+		ctx.ui.setStatus("tsukuyomi-agent", activeAgent?.name);
+		ctx.ui.setWidget("tsukuyomi-agent-payload", activeAgent ? [JSON.stringify({
+			id: activeAgent.id, name: activeAgent.name, description: activeAgent.description,
+			provider: activeAgent.provider, model: activeAgent.model, thinking: activeAgent.thinking, mode: activeAgent.mode,
+		})] : undefined);
+	};
+	const activateCustomAgent = async (agent: any, ctx: ExtensionContext, persist = true) => {
+		if (!agent) throw new Error("Agent not found");
+		if (agent.accountRef) {
+			const providerId = typeof agent.accountRef === "object" ? agent.accountRef.providerId : agent.provider;
+			const accountId = typeof agent.accountRef === "object" ? agent.accountRef.id : agent.accountRef;
+			if (!providerId || !accountId || !activateAccount(agentDir, providerId, accountId)) throw new Error(`Unknown account for agent ${agent.id}`);
+			await ctx.modelRegistry.refresh();
+		}
+		if (agent.provider && agent.model) {
+			const model = ctx.modelRegistry.find(agent.provider, agent.model);
+			if (!model) throw new Error(`Model not found: ${agent.provider}/${agent.model}`);
+			if (!await pi.setModel(model)) throw new Error(`No configured credentials for ${agent.provider}`);
+		}
+		pi.setThinkingLevel(agent.thinking as any);
+		if (Array.isArray(agent.tools)) pi.setActiveTools(policy.prune(agent.tools));
+		if (agent.mode) {
+			mode = agent.mode;
+			await modes.setMode(ctx, agent.mode);
+		}
+		activeAgent = agent;
+		if (persist) pi.appendEntry("tsukuyomi-agent", { id: agent.id, name: agent.name });
+		publishAgent(ctx);
+	};
 
 	policy.installGuard();
 	registerLsp(pi);
+	registerQuestionnaire(pi);
 	registerTasks(pi);
+	registerAgentTeams(pi, agentDir, policy);
 	registerWebFetch(pi);
 	registerWebSearch(pi);
+
+	pi.registerCommand("kagent", {
+		description: "Manage saved agents: /kagent list | use <id> | delete <id>",
+		handler: async (args, ctx) => {
+			const [verb = "list", id] = args.trim().split(/\s+/);
+			if (verb === "list") {
+				const agents = listAgents(agentDir);
+				ctx.ui.setWidget("tsukuyomi-agents-payload", [JSON.stringify({ agents: agents.map(({ systemPrompt: _prompt, ...item }) => item) })]);
+				ctx.ui.notify(agents.length ? `Agents: ${agents.map((item) => `${item.id} (${item.name})`).join(", ")}` : "No saved agents", "info");
+				return;
+			}
+			if (verb === "use" && id) {
+				try { await activateCustomAgent(getAgent(agentDir, id), ctx); ctx.ui.notify(`Agent ${id} activated.`, "info"); }
+				catch (error) { ctx.ui.notify(`Agent not activated: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+				return;
+			}
+			if (verb === "delete" && id) {
+				ctx.ui.notify(deleteAgent(agentDir, id) ? `Agent ${id} deleted.` : `Agent ${id} not found.`, "info");
+				return;
+			}
+			ctx.ui.notify("Usage: /kagent list | use <id> | delete <id>", "warning");
+		},
+	});
 
 	pi.registerTool({
 		name: "todo",
@@ -121,6 +182,7 @@ export default function tsukuyomiBackend(pi: ExtensionAPI): void {
 				return;
 			}
 			await modes.setMode(ctx, requested);
+			mode = requested;
 		},
 	});
 
@@ -171,7 +233,7 @@ export default function tsukuyomiBackend(pi: ExtensionAPI): void {
 		description: "Manage providers: /kprovider list | add <json> | remove <id> | login-key <id> <key>",
 		handler: async (args, ctx) => {
 			const [verb = "list", ...rest] = args.trim().split(/\s+/);
-			const agentDir = process.env.TSUKUYOMI_DIR || process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".tsukuyomi", "agent");
+			const agentDir = process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".tsukuyomi", "agent");
 			if (verb === "list") {
 				try {
 					// providers.json is the source of truth; models.json is derived.
@@ -237,11 +299,30 @@ export default function tsukuyomiBackend(pi: ExtensionAPI): void {
 		}
 	};
 
+	pi.on("before_agent_start", (event) => {
+		if (!activeAgent?.systemPrompt) return;
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n## Active Tsukuyomi agent: ${activeAgent.name}\n${activeAgent.systemPrompt}`,
+		};
+	});
+
 	pi.on("session_start", (_event, ctx) => {
 		restoreTodos(ctx);
+		const entry = ctx.sessionManager.getBranch().filter((item: any) => item.type === "custom" && item.customType === "tsukuyomi-agent").at(-1) as any;
+		const restored = entry?.data?.id ? getAgent(agentDir, entry.data.id) : undefined;
+		activeAgent = undefined;
+		publishAgent(ctx);
+		if (restored) void activateCustomAgent(restored, ctx, false).catch((error) => ctx.ui.notify(`Saved agent unavailable: ${error.message}`, "warning"));
 		modes.reapply(ctx);
 		setTimeout(() => policy.publish(ctx), 0);
 	});
 
-	pi.on("session_tree", (_event, ctx) => restoreTodos(ctx));
+	pi.on("session_tree", (_event, ctx) => {
+		restoreTodos(ctx);
+		const entry = ctx.sessionManager.getBranch().filter((item: any) => item.type === "custom" && item.customType === "tsukuyomi-agent").at(-1) as any;
+		const restored = entry?.data?.id ? getAgent(agentDir, entry.data.id) : undefined;
+		activeAgent = undefined;
+		publishAgent(ctx);
+		if (restored) void activateCustomAgent(restored, ctx, false).catch(() => {});
+	});
 }

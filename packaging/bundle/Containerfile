@@ -1,0 +1,2 @@
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y --setopt=install_weak_deps=False install rpm-build tar zstd findutils cpio git socat pacman libarchive make binutils fakeroot ripgrep shadow-utils util-linux && dnf clean all

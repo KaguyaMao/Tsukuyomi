@@ -15,7 +15,7 @@ const languages = { ".ts": "typescript", ".tsx": "typescriptreact", ".js": "java
 function readConfig(file) { if (!existsSync(file)) return {}; try { const value = JSON.parse(readFileSync(file, "utf8")); return value.servers || value; } catch { throw new Error(`Invalid LSP configuration: ${file}`); } }
 export function lspConfig(cwd, agentDir) {
 	const servers = { ...defaults };
-	for (const file of [join(agentDir, "lsp.json"), join(cwd, ".pi", "lsp.json"), join(cwd, ".tsukuyomi", "lsp.json")]) {
+	for (const file of [join(agentDir, "lsp.json")]) {
 		for (const [name, value] of Object.entries(readConfig(file))) servers[name] = { ...servers[name], ...value };
 	}
 	return servers;

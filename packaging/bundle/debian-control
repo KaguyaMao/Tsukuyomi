@@ -1,0 +1,16 @@
+Package: tsukuyomi
+Version: @VERSION@-@RELEASE@
+Section: devel
+Priority: optional
+Architecture: amd64
+Maintainer: Tsukuyomi contributors
+Homepage: https://github.com/KaguyaMao/Tsukuyomi
+Installed-Size: @INSTALLED_SIZE@
+Depends: bash, ca-certificates, git, ripgrep, libc6 (>= 2.28), libstdc++6, libgcc-s1 | libgcc1
+Recommends: socat, wl-clipboard | xclip
+Description: Independent coding-agent terminal interface powered by Pi
+ Tsukuyomi provides a full-screen terminal UI, workspace panels, sessions,
+ tools, LSP integration and a private Pi coding-agent runtime.
+ .
+ This x86_64 package bundles Node.js @NODE_VERSION@, npm, Pi @PI_VERSION@ and
+ all application dependencies. It does not replace the system Node.js or Pi.

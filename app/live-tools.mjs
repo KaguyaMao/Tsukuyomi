@@ -63,6 +63,12 @@ export class LiveTool {
 			this.bodyLines = String(body).split("\n");
 		}
 		const lines = this.bodyLines;
+		if (["read", "view"].includes(this.name) && this.status !== "running" && body.trim()) {
+			output.push({ kind: "meta", text: `${zh ? "已读取" : "Read"} ${lines.length} ${zh ? "行" : "lines"}` });
+		}
+		if (this.name === "bash" && this.status === "running" && !body.trim()) {
+			output.push({ kind: "meta", text: zh ? "等待命令输出…" : "Waiting for command output…" });
+		}
 		const height = this.expanded ? Math.max(8, Math.floor(terminalRows * 0.65)) : 8;
 		this.maxOffset = Math.max(0, lines.length - height);
 		this.offset = Math.min(this.offset, this.maxOffset);

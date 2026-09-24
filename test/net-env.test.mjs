@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +15,8 @@ import {
 	needsProxyRestart,
 	networkEnvForChild,
 	parseEnvFile,
+	parseProxyTarget,
+	probeProxy,
 	restartWithProxy,
 	withRequireOption,
 } from "../app/net-env.mjs";
@@ -52,7 +55,8 @@ test("envFileCandidates puts an explicit override first", () => {
 	}
 	const plain = envFileCandidates({ agentDir: "/tmp/agent", home: "/home/u" });
 	assert.ok(plain.some((path) => path.endsWith("/.tsukuyomi/agent/.env")));
-	assert.ok(plain.some((path) => path.endsWith("/.kaguyapi/agent/.env")));
+	assert.equal(plain.some((path) => path.endsWith("/.kaguyapi/agent/.env")), false);
+	assert.equal(plain.some((path) => path.endsWith("/.pi/.env")), false);
 });
 
 test("loadEnvFile reads the agent .env and honors TSUKUYOMI_NO_PROXY_FILE", () => {
@@ -102,7 +106,7 @@ test("installFetchHook loads the hook and reports failure gracefully", () => {
 	assert.equal(installFetchHook(undefined, { require }), false);
 });
 
-test("applyNetworkEnv applies proxy gaps and configures the child env", () => {
+test("applyNetworkEnv applies proxy gaps and configures the child env", async () => {
 	const home = mkdtempSync(join(tmpdir(), "tsukuyomi-home-"));
 	const agentDir = join(home, ".tsukuyomi", "agent");
 	mkdirSync(agentDir, { recursive: true });
@@ -112,9 +116,11 @@ test("applyNetworkEnv applies proxy gaps and configures the child env", () => {
 	delete globalThis.__tsukuyomiCurlFetchInstalled;
 
 	const env = { TSUKUYOMI_CURL_FETCH: hook };
-	const result = applyNetworkEnv({ agentDir, appRoot: home, home, env });
+	const result = await applyNetworkEnv({ agentDir, appRoot: home, home, env, probe: async () => true });
 	assert.equal(result.envFile, join(agentDir, ".env"));
 	assert.deepEqual(result.applied, ["HTTPS_PROXY"]);
+	assert.equal(result.proxyUsable, true);
+	assert.equal(result.proxy, "http://127.0.0.1:12450");
 	assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:12450");
 	// Non-network keys from the file must not leak into the environment.
 	assert.equal(env.SECRET_TOKEN, undefined);
@@ -130,15 +136,73 @@ test("applyNetworkEnv applies proxy gaps and configures the child env", () => {
 	delete globalThis.__tsukuyomiCurlFetchInstalled;
 });
 
-test("applyNetworkEnv never overrides an explicit proxy", () => {
+test("applyNetworkEnv never overrides an explicit proxy", async () => {
 	const home = mkdtempSync(join(tmpdir(), "tsukuyomi-home-"));
 	const agentDir = join(home, "agent");
 	mkdirSync(agentDir, { recursive: true });
 	writeFileSync(join(agentDir, ".env"), "HTTPS_PROXY=http://from-file\n");
 	const env = { HTTPS_PROXY: "http://from-shell" };
-	const result = applyNetworkEnv({ agentDir, appRoot: home, home, env });
+	const result = await applyNetworkEnv({ agentDir, appRoot: home, home, env, probe: async () => true });
 	assert.equal(env.HTTPS_PROXY, "http://from-shell");
 	assert.equal(result.applied.includes("HTTPS_PROXY"), false);
+});
+
+test("parseProxyTarget resolves host and default ports", () => {
+	assert.deepEqual(parseProxyTarget("http://127.0.0.1:12450"), { host: "127.0.0.1", port: 12450 });
+	assert.deepEqual(parseProxyTarget("127.0.0.1:8080"), { host: "127.0.0.1", port: 8080 });
+	assert.deepEqual(parseProxyTarget("https://proxy.example.com"), { host: "proxy.example.com", port: 443 });
+	assert.deepEqual(parseProxyTarget("socks5://127.0.0.1"), { host: "127.0.0.1", port: 1080 });
+	assert.equal(parseProxyTarget(""), undefined);
+	assert.equal(parseProxyTarget("http://"), undefined);
+	assert.equal(parseProxyTarget("::not a url::"), undefined);
+});
+
+test("probeProxy reports a listening port reachable and a closed one not", async () => {
+	const server = createServer();
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const port = server.address().port;
+	try {
+		assert.equal(await probeProxy(`http://127.0.0.1:${port}`, { timeoutMs: 500 }), true);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+	assert.equal(await probeProxy(`http://127.0.0.1:${port}`, { timeoutMs: 500 }), false);
+});
+
+test("applyNetworkEnv drops an unreachable proxy and connects directly", async () => {
+	const home = mkdtempSync(join(tmpdir(), "tsukuyomi-home-"));
+	const agentDir = join(home, ".tsukuyomi", "agent");
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(join(agentDir, ".env"), "HTTPS_PROXY=http://127.0.0.1:12450\nhttp_proxy=http://127.0.0.1:12450\n");
+	const env = {};
+	const result = await applyNetworkEnv({ agentDir, appRoot: home, home, env, probe: async () => false });
+	assert.equal(result.proxyUsable, false);
+	assert.equal(result.proxy, "http://127.0.0.1:12450");
+	assert.equal(env.HTTPS_PROXY, undefined);
+	assert.equal(env.http_proxy, undefined);
+	assert.equal(result.applied.includes("HTTPS_PROXY"), false);
+	assert.ok(result.skipped.includes("HTTPS_PROXY"));
+	// Without a proxy the kernel must not be told to use one.
+	assert.equal(networkEnvForChild({ nodeOptions: result.nodeOptions, env }).HTTPS_PROXY, undefined);
+});
+
+test("applyNetworkEnv can disable the probe with TSUKUYOMI_PROXY_PROBE=0", async () => {
+	const home = mkdtempSync(join(tmpdir(), "tsukuyomi-home-"));
+	const agentDir = join(home, "agent");
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(join(agentDir, ".env"), "HTTPS_PROXY=http://127.0.0.1:12450\n");
+	const env = { TSUKUYOMI_PROXY_PROBE: "0" };
+	let probed = false;
+	const result = await applyNetworkEnv({
+		agentDir,
+		appRoot: home,
+		home,
+		env,
+		probe: async () => { probed = true; return false; },
+	});
+	assert.equal(probed, false);
+	assert.equal(result.proxyUsable, true);
+	assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:12450");
 });
 
 test("needsProxyRestart only fires when a proxy is set and it is the first pass", () => {

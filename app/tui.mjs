@@ -1,5 +1,6 @@
-import { execFile } from "node:child_process";
-import { readFileSync, readdirSync, realpathSync, statSync, appendFileSync, mkdirSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { readFileSync, readdirSync, realpathSync, statSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolvePiTui } from "./pi-runtime.mjs";
@@ -31,6 +32,7 @@ import {
 import {
 	IncrementalText,
 	adaptiveFrameDelay,
+	assistantErrorMessage,
 	createLruCache,
 	limitRows,
 	paintBackground,
@@ -58,15 +60,34 @@ import {
 	normalizeLocale,
 } from "./i18n.mjs";
 import { loadPreferences, savePreferences } from "./preferences.mjs";
+import { applySourceUpdate, checkForUpdates, formatUpdateDetails } from "./updater.mjs";
 import { filterSessionCatalog, scanSessionCatalog, trashSession } from "./session-store.mjs";
 import { removeProviderConfig, saveProviderConfig } from "./providers/config/opencode.mjs";
 import { buildCustomProvider } from "./providers/config/discovery.mjs";
 import { removeProviderFromModelsJson, syncProviderToModelsJson, toProviderConfigInput } from "./providers/config/sync.mjs";
 import { ProviderUsageClient } from "./providers/usage.mjs";
 import { activeAccount, activateAccount, listAccounts, listAllAccounts, migrateAllCurrentCredentials, migrateCurrentCredential, saveAccount } from "./providers/accounts.mjs";
+import { syncCodexCredential } from "./providers/codex-auth.mjs";
 import { getStoredCredential } from "./providers/store.mjs";
-import { renderMarkdown, inlineAnsi, highlight, langFromPath } from "./markdown.mjs";
+import { renderMarkdown, renderOutputBlock, renderStreamingCodeBlock, inlineAnsi, highlight, langFromPath } from "./markdown.mjs";
+import { createTsukuyomiDesignSystem } from "./design-system.mjs";
+import { formatTime, formatAgo, formatDuration, TOOL_LABEL_KEYS, toolLabel } from "./tui/formatters.mjs";
+import { wideComposerGeometry } from "./tui/composer-layout.mjs";
+import { renderUserMessageBand } from "./tui/message-band.mjs";
+import { matchesTuiAction, resolveTuiKeybindings } from "./tui/keybindings.mjs";
+import { createExtensionDialogQueue } from "./tui/dialog-requests.mjs";
+import { decodeStructuredTitle, readStructuredWidget, structuredPreview, STRUCTURED_WIDGET } from "./tui/structured-ui.mjs";
+import { createToolCallStream } from "./tui/toolcall-stream.mjs";
+import { filterSelectOptions, selectListState } from "./tui/select-list.mjs";
+import { layoutPlanReview } from "./tui/plan-review.mjs";
+import { askPanelModel } from "./tui/ask-panel.mjs";
+import { createPlanSession, joinPlan, planCommand, planResult } from "./tui/plan-session.mjs";
+import { askCommand, askResult, createAskSession } from "./tui/ask-session.mjs";
+import { buildAgentHubRows } from "./tui/agent-hub.mjs";
+import { deleteAgent, getAgent, listAgents, saveAgent } from "./agents.mjs";
+import { discoverSkills, loadSkillSettings, saveSkillSettings } from "./skills.mjs";
 
+const design = createTsukuyomiDesignSystem();
 const ESC = "\x1b[";
 // Zero-width APC marker the bundled Editor emits at the hardware-cursor cell.
 // Must match `CURSOR_MARKER` in the pi-tui runtime that owns the final frame.
@@ -78,7 +99,7 @@ const CURSOR_RESET = "\x1b[0 q";
 const rgb = (r, g, b) => (value) => `${ESC}38;2;${r};${g};${b}m${value}${ESC}39m`;
 // Grok Build's canvas is a warm charcoal rather than terminal black. Keep the
 // explicit background on every composed row so terminal themes cannot tint it.
-const BLACK_BACKGROUND = `${ESC}48;2;18;18;18m`;
+const BLACK_BACKGROUND = design.backgrounds.canvas;
 const blackBackground = (value) => `${paintBackground(value, BLACK_BACKGROUND)}${ESC}49m`;
 const bold = (value) => `${ESC}1m${value}${ESC}22m`;
 const dim = (value) => `${ESC}2m${value}${ESC}22m`;
@@ -86,30 +107,38 @@ const modalGrayDim = rgb(88, 88, 88);
 const modalPrimary = rgb(225, 225, 225);
 
 const color = {
-	text: rgb(235, 235, 235),
-	muted: rgb(117, 117, 117),
-	dim: rgb(82, 82, 82),
-	accent: rgb(137, 200, 255),
-	secondary: rgb(177, 142, 221),
-	title: rgb(232, 174, 82),
-	success: rgb(148, 210, 102),
-	warning: rgb(232, 174, 82),
-	error: rgb(255, 116, 139),
-	border: rgb(68, 68, 72),
+	text: design.fg.text,
+	muted: design.fg.muted,
+	dim: design.fg.dim,
+	accent: design.fg.accent,
+	secondary: design.fg.secondary,
+	title: design.fg.brand,
+	success: design.fg.success,
+	warning: design.fg.warning,
+	error: design.fg.error,
+	border: design.fg.border,
+	borderMuted: design.fg.borderMuted,
+	thinkingMinimal: design.fg.thinkingMinimal,
+	thinkingLow: design.fg.thinkingLow,
+	thinkingMedium: design.fg.thinkingMedium,
+	thinkingHigh: design.fg.thinkingHigh,
+	thinkingXhigh: design.fg.thinkingXhigh,
+	thinkingMax: design.fg.thinkingMax,
 };
-const DIM_OPEN = `${ESC}38;2;82;82;82m`;
+const DIM_OPEN = `${ESC}38;2;${design.palette.dim}m`;
 
-const BAND_BACKGROUND = `${ESC}48;2;36;36;36m`;
+const BAND_BACKGROUND = design.backgrounds.band;
 const bandBackground = (value) => paintBackground(value, BAND_BACKGROUND);
-const LIST_SELECTION_BACKGROUND = `${ESC}48;2;54;54;54m`;
+const LIST_SELECTION_BACKGROUND = design.backgrounds.selection;
 const listSelection = (value) => paintBackground(value, LIST_SELECTION_BACKGROUND);
-const PANEL_BACKGROUND = `${ESC}48;2;15;15;16m`;
-const PANEL_HOVER_BACKGROUND = `${ESC}48;2;35;35;36m`;
-const TOOL_BACKGROUND = BLACK_BACKGROUND;
-const MENU_BACKGROUND = `${ESC}48;2;22;22;22m`;
-const MENU_SELECTION_BACKGROUND = `${ESC}48;2;255;176;123m`;
+const PANEL_BACKGROUND = design.backgrounds.panel;
+const PANEL_HOVER_BACKGROUND = design.backgrounds.panelHover;
+const TOOL_BACKGROUND = design.backgrounds.tool;
+const MENU_BACKGROUND = design.backgrounds.menu;
+const MENU_SELECTION_BACKGROUND = design.backgrounds.menuSelection;
+const PROMPT_BACKGROUND = design.backgrounds.band;
 const menuBackground = (value) => `${paintBackground(value, MENU_BACKGROUND)}${BLACK_BACKGROUND}`;
-const menuSelection = (value) => `${paintBackground(rgb(25, 25, 25)(value), MENU_SELECTION_BACKGROUND)}${MENU_BACKGROUND}`;
+const menuSelection = (value) => `${paintBackground(color.text(value), MENU_SELECTION_BACKGROUND)}${MENU_BACKGROUND}`;
 const DIFF_ADD_BACKGROUND = `${ESC}48;2;0;58;20m`;
 const DIFF_REMOVE_BACKGROUND = `${ESC}48;2;76;18;26m`;
 // Panel rows are concatenated with the black session surface in wide layouts.
@@ -132,113 +161,6 @@ const TSUKUYOMI_LOGO = [
 	"   ██║    ███████║ ╚██████╔╝ ██║  ██╗ ╚██████╔╝    ██║    ╚██████╔╝ ██║ ╚═╝ ██║ ██║",
 	"   ╚═╝    ╚══════╝  ╚═════╝  ╚═╝  ╚═╝  ╚═════╝     ╚═╝     ╚═════╝  ╚═╝     ╚═╝ ╚═╝",
 ];
-
-function formatTime(value, locale = "en") {
-	const date = new Date(Number(value));
-	if (!Number.isFinite(date.getTime())) return "";
-	try {
-		return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
-			hour: "numeric",
-			minute: "2-digit",
-			hour12: locale !== "zh",
-		}).format(date);
-	} catch {
-		const hour = locale === "zh" ? date.getHours() : ((date.getHours() + 11) % 12) + 1;
-		const suffix = locale === "zh" ? "" : ` ${date.getHours() < 12 ? "AM" : "PM"}`;
-		return `${hour}:${String(date.getMinutes()).padStart(2, "0")}${suffix}`;
-	}
-}
-
-function formatAgo(value, locale = "en", now = Date.now()) {
-	const seconds = Math.max(0, Math.floor((now - Number(value || 0)) / 1000));
-	if (seconds < 60) return locale === "zh" ? "刚刚" : "now";
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return locale === "zh" ? `${minutes} 分钟前` : `${minutes}m ago`;
-	const hours = Math.floor(minutes / 60);
-	if (hours < 24) return locale === "zh" ? `${hours} 小时前` : `${hours}h ago`;
-	const days = Math.floor(hours / 24);
-	return locale === "zh" ? `${days} 天前` : `${days}d ago`;
-}
-
-function formatDuration(totalSeconds, locale = "en") {
-	if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "";
-	const seconds = totalSeconds;
-	if (locale === "zh") {
-		if (seconds < 60) return `${seconds % 1 ? seconds.toFixed(1) : Math.round(seconds)}秒`;
-		const minutes = Math.floor(seconds / 60);
-		const rest = Math.round(seconds % 60);
-		return rest ? `${minutes}分${rest}秒` : `${minutes}分`;
-	}
-	if (seconds < 60) return seconds % 1 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
-	const minutes = Math.floor(seconds / 60);
-	const rest = Math.round(seconds % 60);
-	return `${minutes}m${rest}s`;
-}
-
-const TOOL_LABEL_KEYS = {
-	read: "tools.read",
-	edit: "tools.edit",
-	write: "tools.write",
-	bash: "tools.bash",
-	powershell: "tools.powershell",
-	glob: "tools.glob",
-	grep: "tools.grep",
-	list: "tools.list",
-	ls: "tools.list",
-	find: "tools.find",
-	todo: "tools.todo",
-	web_fetch: "tools.webFetch",
-	web_search: "tools.webSearch",
-	apply_patch: "tools.applyPatch",
-};
-
-function toolLabel(name, args, translate = (key) => key) {
-	const argText = (key) => {
-		const value = args?.[key];
-		if (typeof value === "string" && value.trim()) return value;
-		if (value != null && typeof value !== "object") return String(value);
-		return "";
-	};
-	switch (name) {
-		case "read":
-		case "write":
-		case "edit": {
-			const target = argText("path") || argText("filePath") || argText("file");
-			if (!target) return translate(TOOL_LABEL_KEYS[name] || name);
-			const verbKey = name === "read" ? "toolVerb.read" : name === "write" ? "toolVerb.write" : "toolVerb.edit";
-			return `${translate(verbKey)} ${target}`;
-		}
-		case "bash": {
-			const command = argText("command") || argText("cmd");
-			return command ? `${translate("toolVerb.run")} ${command}` : translate("toolVerb.run");
-		}
-		case "grep":
-		case "search": {
-			const pattern = argText("pattern") || argText("query");
-			return pattern ? `${translate("toolVerb.search")} ${pattern}` : translate("toolVerb.search");
-		}
-		case "glob": {
-			const glob = argText("glob") || argText("pattern");
-			return glob ? `${translate("toolVerb.list")} ${glob}` : translate("toolVerb.list");
-		}
-		case "list": {
-			const target = argText("path") || argText("dir") || argText("dirPath");
-			return target ? `${translate("toolVerb.list")} ${target}` : translate("toolVerb.list");
-		}
-		case "web_fetch": {
-			const target = argText("url");
-			return target ? `${translate("toolVerb.fetch")} ${target}` : translate("tools.webFetch");
-		}
-		case "web_search": {
-			const query = argText("query");
-			return query ? `${translate("toolVerb.search")} ${query}` : translate("tools.webSearch");
-		}
-		default: {
-			const summary = argText("command") || argText("path") || argText("action") || argText("query") || argText("pattern") || argText("filePath");
-			return summary ? `${translate(TOOL_LABEL_KEYS[name] || name)} ${summary}` : translate(TOOL_LABEL_KEYS[name] || name);
-		}
-	}
-}
 
 const LOGO = [
 	"██╗  ██╗ █████╗  ██████╗ ██╗   ██╗██╗   ██╗ █████╗ ██████╗ ██╗",
@@ -405,7 +327,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const startPerfLog = (file) => {
 		if (perfTimer) return perfLogFile;
 		perfLogFile = file || process.env.TSUKUYOMI_PERF_FILE || process.env.KAGUYAPI_PERF_FILE ||
-			join(process.env.TSUKUYOMI_DIR || process.env.KAGUYAPI_DIR || process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || "", ".tsukuyomi", "agent"), "perf.log");
+			join(process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || "", ".tsukuyomi", "agent"), "perf.log");
 		try { mkdirSync(dirname(perfLogFile), { recursive: true }); } catch {}
 		perfTimer = setInterval(() => {
 			try { appendFileSync(perfLogFile, `${perfSnapshot()}\n`); } catch {}
@@ -431,10 +353,25 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const rpc = workspaceEntry?.rpc || new PiRpc(piBin, args, env, cwd);
 	const taskClient = new TaskClient(env);
 	const tree = new WorkspaceTree(cwd);
+	// Re-reading the workspace tree on every edit/write/bash tool blocks the main
+	// thread even when the Files rail is hidden. Track staleness and refresh only
+	// when the tree is actually visible (or explicitly reopened).
+	let treeStale = false;
+	const refreshTree = () => {
+		if (!state.showFiles) { treeStale = true; return; }
+		treeStale = false;
+		tree.refresh();
+	};
 	const gitBranch = readBranch(cwd);
 	// Single agent directory owns auth.json / providers.json / models.json.
-	const agentDir = env?.PI_CODING_AGENT_DIR;
+	const agentDir = env?.TSUKUYOMI_DIR || env?.PI_CODING_AGENT_DIR;
 	const preferences = loadPreferences(agentDir);
+	const initialKeybindingPreset = preferences.keybindingPreset === "legacy" ? "legacy" : "omp";
+	let activeKeybindings = resolveTuiKeybindings(initialKeybindingPreset, preferences.keybindingOverrides);
+	const discoveredSkills = discoverSkills(agentDir);
+	const skillDiagnostics = discoveredSkills.diagnostics;
+	let managedSkills = discoveredSkills.skills;
+	let disabledSkills = new Set(loadSkillSettings(agentDir).disabled);
 	const configuredLocale = normalizeLocale(env?.TSUKUYOMI_LANG || env?.KAGUYAPI_LANG) || normalizeLocale(preferences.language);
 	let locale = configuredLocale || detectLocale({ ...process.env, ...env });
 	let t = createTranslator(locale);
@@ -451,6 +388,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		compactStatus: "",
 		messages: [],
 		messageRevision: 0,
+		assistantCount: 0,
 		streamingText: "",
 		streamingThinking: "",
 		stream: [],
@@ -476,10 +414,11 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		contextPercent: undefined,
 		contextTokens: undefined,
 		mode: args.includes("--plan") ? "plan" : "build",
+		keybindingPreset: initialKeybindingPreset,
 		workspaceDeclared: workspaceExplicit,
 		showFiles: false,
-		showWorkflow: preferences.rightSidebarDefault !== false,
-		showTodos: preferences.rightSidebarDefault !== false,
+		showWorkflow: preferences.rightSidebarDefault === true || (initialKeybindingPreset === "legacy" && preferences.rightSidebarDefault !== false),
+		showTodos: preferences.rightSidebarDefault === true || (initialKeybindingPreset === "legacy" && preferences.rightSidebarDefault !== false),
 		thinkingAutoCollapse: preferences.thinkingAutoCollapse !== false,
 		markdown: preferences.markdown !== false,
 		fileScroll: 0,
@@ -503,10 +442,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		statuses: new Map(),
 		widgets: new Map(),
 		tools: { available: [], active: [], disabled: [], labels: {} },
+		team: undefined,
+		activeAgent: undefined,
 		toast: t("toast.starting"),
 		toastType: "info",
 		toastUntil: Date.now() + 10_000,
 		dialog: undefined,
+		updating: false,
 		touchMode: (process.env.TSUKUYOMI_TOUCH_MODE ?? process.env.KAGUYAPI_TOUCH_MODE) === "1" || (process.env.TSUKUYOMI_TOUCH_MODE ?? process.env.KAGUYAPI_TOUCH_MODE) === "true" || preferences.touchMode === true,
 		pointer: new PointerCapture(),
 		lastTerminalWidth: 0,
@@ -520,16 +462,20 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		transcriptScrollbar: undefined,
 		transcriptScrollbarDrag: undefined,
 		queued: 0,
+		queueItems: { steering: [], followUp: [] },
+		queueScroll: 0,
+		queueMaxScroll: 0,
 		userTurnCount: 0,
 		dirtyToolIds: new Set(),
 		mouseZones: [],
 		primaryPastePending: false,
 		stopped: false,
 	};
+	const keyMatches = (data, action) => matchesTuiAction(data, action, activeKeybindings, matchesKey);
 	if ((process.env.TSUKUYOMI_PERF ?? process.env.KAGUYAPI_PERF) === "1") startPerfLog();
 
 	const editorTheme = {
-		borderColor: color.border,
+		borderColor: color.borderMuted,
 		selectList: {
 			selectedPrefix: color.accent,
 			selectedText: (value) => bold(color.text(value)),
@@ -539,6 +485,71 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		},
 	};
 	const editor = new Editor(tui, editorTheme, { paddingX: 1, autocompleteMaxVisible: 8 });
+	const pendingStructured = new Map();
+	const extensionDialogs = createExtensionDialogQueue({
+		isBusy: () => Boolean(state.dialog),
+		respond: (response) => rpc.respond(response),
+		onExpired: (id) => {
+			if (state.dialog?.source !== "pi" || state.dialog.id !== id) return;
+			if (state.dialog.kind === "input" || state.dialog.kind === "editor") editor.setText(state.dialog.savedText || "");
+			state.dialog = undefined;
+			state.pointer.cancel();
+			tui.requestRender();
+		},
+		present: (event) => {
+			const kind = event.method;
+			const metadata = decodeStructuredTitle(event.title, pendingStructured);
+			const options = kind === "confirm" ? [t("action.yes"), t("action.no")] : (event.options || []);
+			const visualKind = metadata.structured?.kind === "plan-review" ? "plan-review" : metadata.structured?.kind === "questionnaire" ? "ask" : kind;
+			clearTerminalSelection();
+			state.dialog = {
+				source: "pi",
+				id: event.id,
+				kind: visualKind,
+				rpcKind: kind,
+				title: metadata.title || t("dialog.plugin"),
+				structured: metadata.structured,
+				planSession: visualKind === "plan-review" ? createPlanSession({ body: metadata.structured?.payload?.body || "", options }) : undefined,
+				askSession: visualKind === "ask" && metadata.structured?.payload?.mode === "batch" ? createAskSession(metadata.structured.payload.questions) : undefined,
+				message: event.message || (kind === "input" ? event.placeholder : undefined),
+				...selectListState({ options, kind }),
+				savedText: editor.getText(),
+			};
+			if (kind === "input") editor.setText("");
+			if (kind === "editor") editor.setText(event.prefill || "");
+			if (visualKind === "plan-review") {
+				void availableThinkingLevels().then((levels) => {
+					if (state.dialog?.planSession && levels.length) {
+						state.dialog.planSession.slider = levels;
+						const current = levels.indexOf(state.thinking);
+						state.dialog.planSession.sliderIndex = current >= 0 ? current : 0;
+						tui.requestRender();
+					}
+				}).catch(() => {});
+			}
+			tui.requestRender();
+		},
+	});
+	const replaceDialog = (dialog) => {
+		const previous = state.dialog;
+		if (previous?.source === "pi") extensionDialogs.cancelActive();
+		if (previous && (previous.kind === "input" || previous.kind === "editor")) editor.setText(previous.savedText || "");
+		state.dialog = dialog;
+		// Async local flows may open a new modal while another owns the focus.
+		// Cancel the displaced owner exactly once rather than leaving its promise
+		// unresolved or silently returning the new modal's input as its answer.
+		if (previous && previous !== dialog && previous.source !== "pi" && previous.onResolve) {
+			queueMicrotask(() => {
+				try { const task = previous.onResolve({ cancelled: true }); task?.catch?.((error) => toast(error.message || String(error), "error")); }
+				catch (error) { toast(error.message || String(error), "error"); }
+			});
+		}
+	};
+	const clearDialog = () => {
+		if (state.dialog?.source === "pi") extensionDialogs.cancelActive();
+		state.dialog = undefined;
+		extensionDialogs.available();
+	};
 	if (workspaceEntry?.state) Object.assign(state, workspaceEntry.state, { pointer: new PointerCapture(), stopped: false });
 	if (workspaceEntry?.draft) editor.setText(workspaceEntry.draft);
 	const editorInputFocused = () => editor.focused &&
@@ -552,6 +563,21 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	let editorCacheLines;
 	const resetCursorBlink = () => { editorRevision += 1; requestDraw(true); };
 	const renderEditor = (width) => {
+		// Keep the current reasoning level visible even while idle. This makes the
+		// composer a persistent affordance instead of only coloring during a run.
+		const thinkingBorder = {
+			off: color.borderMuted,
+			minimal: color.thinkingMinimal,
+			low: color.thinkingLow,
+			medium: color.thinkingMedium,
+			high: color.thinkingHigh,
+			xhigh: color.thinkingXhigh,
+			max: color.thinkingMax,
+		};
+		editorTheme.borderColor = state.mode === "plan" && state.thinking === "off"
+			? color.warning
+			: thinkingBorder[state.thinking] || color.borderMuted;
+		editor.borderColor = editorTheme.borderColor;
 		if (state.dialog?.secret) return ["•".repeat(Math.min(Math.max(0, width - 1), [...editor.getText()].length))];
 		const wasFocused = editor.focused;
 		// Keep focus true for every render while the editor owns input. This keeps
@@ -563,7 +589,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		return lines;
 	};
 	const editorLinesFor = (width) => {
-		const key = `${width}|${editorRevision}|${editorInputFocused() ? 1 : 0}|${state.dialog?.secret ? 1 : 0}|${editor.getText().length}`;
+		const key = `${width}|${editorRevision}|${editorInputFocused() ? 1 : 0}|${state.dialog?.secret ? 1 : 0}|${state.mode}|${state.working ? 1 : 0}|${state.thinking}|${editor.getText().length}`;
 		if (editorCacheKey === key) return editorCacheLines;
 		editorCacheLines = renderEditor(width);
 		editorCacheKey = key;
@@ -652,6 +678,23 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		(state.markdown && row.kind === "text")
 			? (value) => value
 			: (row.kind === "add" ? color.success : row.kind === "remove" ? color.error : row.kind === "header" ? color.accent : row.kind === "footer" ? color.secondary : color.muted);
+	const renderToolRows = (tool, name, width) => {
+		const source = tool.rows(locale, tui.terminal.rows);
+		const header = source.find((row) => row.kind === "header");
+		const footer = source.findLast((row) => row.kind === "footer");
+		const body = source.filter((row) => row !== header && row !== footer).map((row) => {
+			const content = toolRowContent(row, tool, name);
+			return toolRowPaint(row)(content || " ");
+		});
+		const sections = [{ lines: body }];
+		if (footer) sections.push({ lines: [toolRowPaint(footer)(toolRowContent(footer, tool, name))] });
+		return renderOutputBlock({
+			header: header ? toolRowContent(header, tool, name) : name || "tool",
+			state: tool.status,
+			sections,
+			width: Math.max(8, width - 2),
+		}).map((line) => `  ${line}`);
+	};
 
 	let toastExpiryRendered = false;
 	const toast = (message, type = "info", duration = 4_000) => {
@@ -660,6 +703,24 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		state.toastUntil = Date.now() + duration;
 		toastExpiryRendered = false;
 		tui.requestRender();
+	};
+
+	// Auto-surface a failed assistant turn. Provider/model errors used to exist
+	// only as an (empty) transcript block, so a failed request looked like a
+	// silent stop. Dedupe by message identity so replays and the agent_settled
+	// safety net never bounce the same error twice.
+	let lastTurnErrorKey;
+	const notifyTurnError = (message) => {
+		const reason = assistantErrorMessage(message);
+		if (!reason) return false;
+		const key = `${message.timestamp ?? 0}|${message.provider ?? ""}|${message.model ?? ""}|${reason}`;
+		if (key === lastTurnErrorKey) return false;
+		lastTurnErrorKey = key;
+		const model = [message.provider, message.model].filter(Boolean).join("/") || state.model?.id || t("status.noModel");
+		const summary = reason.length > 300 ? `${reason.slice(0, 299)}…` : reason;
+		const time = formatTime(message.timestamp ?? Date.now(), locale);
+		toast(t("toast.turnError", { model, reason: summary, time }), "error", 12_000);
+		return true;
 	};
 
 	const request = async (command, options = {}) => {
@@ -675,6 +736,12 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	let messagesRefreshPromise;
 	let pendingMessagesSettle = false;
 	let pendingMessagesForceSettle = false;
+	// The live path mirrors `message_end` appends, so a full snapshot is only a
+	// safety net: run it when reconciliation was requested or periodically to
+	// self-heal, instead of paying O(history) at the end of every single turn.
+	let messageLogNeedsReconcile = true;
+	let settledTurns = 0;
+	const RECONCILE_EVERY_TURNS = 10;
 	const rebuildWorkflowHistory = (messages) => {
 		const previous = new Map(state.workflow.map((item) => [item.id, item]));
 		const next = new Map();
@@ -728,6 +795,69 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		}
 		state.workflowRevision += 1;
 	};
+	// Incremental counterpart to rebuildWorkflowHistory for the common case: PI
+	// appends one finalized message per `message_end`, so folding only that
+	// message keeps derivation O(new message) instead of O(entire history).
+	const applyMessageToWorkflow = (message) => {
+		if (!message) return;
+		let changed = false;
+		if (message.role === "assistant") {
+			for (const part of Array.isArray(message.content) ? message.content : []) {
+				if (part?.type !== "toolCall" || part.name === "todo") continue;
+				const id = part.id || part.toolCallId;
+				if (!id) continue;
+				const args = part.arguments || {};
+				const name = part.name || "tool";
+				const existing = state.workflow.find((item) => item.id === id);
+				if (existing) {
+					existing.name = name;
+					existing.args = args;
+					existing.label = toolLabel(name, args, t);
+					existing.summary = clean(args.command || args.path || args.filePath || args.action || args.query || args.pattern || existing.summary || "");
+					existing.startedAt ??= message.timestamp;
+					changed = true;
+				} else {
+					state.workflow.push({
+						id,
+						name,
+						args,
+						label: toolLabel(name, args, t),
+						summary: clean(args.command || args.path || args.filePath || args.action || args.query || args.pattern || ""),
+						status: "done",
+						startedAt: message.timestamp,
+					});
+					changed = true;
+				}
+			}
+		} else if (message.role === "toolResult" && message.toolName !== "todo") {
+			const id = message.toolCallId;
+			if (id) {
+				let item = state.workflow.find((entry) => entry.id === id);
+				if (!item) {
+					item = { id, name: message.toolName || "tool", label: toolLabel(message.toolName || "tool", {}, t), summary: "" };
+					state.workflow.push(item);
+				}
+				const output = clean(toolResultText(message));
+				item.status = message.isError ? "error" : "done";
+				item.output = output || item.output || "";
+				item.error = message.isError ? (output || item.error || t("status.compactionFailed")) : undefined;
+				item.endedAt = message.timestamp || item.endedAt;
+				changed = true;
+			}
+		}
+		if (changed) {
+			if (state.workflow.length > 80) {
+				const removed = state.workflow.splice(0, state.workflow.length - 80);
+				for (const entry of removed) state.workflowExpanded.delete(entry.id);
+			}
+			for (const item of state.workflow) {
+				item.visualCache = undefined;
+				item.collapsedCache = undefined;
+				item.revision = (item.revision || 0) + 1;
+			}
+			state.workflowRevision += 1;
+		}
+	};
 	const resolveRunStartIndex = () => {
 		if (!state.messages.length) return undefined;
 		if (state.runStartText != null) {
@@ -759,12 +889,46 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		clearTerminalSelection();
 		state.messages = Array.isArray(messages) ? messages : [];
 		state.messageRevision = (state.messageRevision || 0) + 1;
-		state.userTurnCount = state.messages.filter((message) => message?.role === "user").length;
+		let userTurns = 0;
+		let assistants = 0;
+		for (const message of state.messages) {
+			if (message?.role === "user") userTurns += 1;
+			else if (message?.role === "assistant") assistants += 1;
+		}
+		state.userTurnCount = userTurns;
+		state.assistantCount = assistants;
 		state.todos = latestTodos(state.messages);
 		rebuildWorkflowHistory(state.messages);
 	};
 
+	// Mirror the PI kernel's own message log incrementally. PI pushes exactly one
+	// finalized message per `message_end`, so appending here keeps `state.messages`
+	// identical to `get_messages` without an O(history) serialization round-trip on
+	// every message. A full refresh still runs at turn settle as a safety net.
+	const appendFinalMessage = (message) => {
+		if (!message || typeof message.role !== "string") return;
+		// Invalidate any in-flight snapshot: its result predates this append and
+		// would otherwise replace the live message with a stale transcript.
+		messagesGeneration += 1;
+		state.messages.push(message);
+		state.messageRevision = (state.messageRevision || 0) + 1;
+		if (message.role === "user") {
+			state.userTurnCount = (state.userTurnCount || 0) + 1;
+			if (state.runStartText != null && clean(textOfContent(message.content)).trim() === state.runStartText) {
+				state.runPromptPersisted = true;
+				state.runStartIndex = state.messages.length - 1;
+			}
+		} else if (message.role === "assistant") {
+			state.assistantCount = (state.assistantCount || 0) + 1;
+		} else if (message.role === "toolResult" && message.toolName === "todo" && Array.isArray(message.details?.todos)) {
+			state.todos = message.details.todos.map((todo) => ({ ...todo }));
+		}
+		applyMessageToWorkflow(message);
+	};
+
+	const toolCallStream = createToolCallStream();
 	const clearStream = () => {
+		toolCallStream.reset();
 		if (!state.stream.length && !state.streamingText && !state.streamingThinking && state.streamStartedAt == null) return;
 		state.stream = [];
 		state.streamingText = "";
@@ -774,8 +938,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	};
 
 	const streamIsCommitted = () => {
-		const assistantCount = state.messages.filter((message) => message?.role === "assistant").length;
-		if (assistantCount > state.streamAssistantBaseline) return true;
+		if ((state.assistantCount || 0) > state.streamAssistantBaseline) return true;
 		const streamedText = state.stream
 			.filter((phase) => phase.kind === "text")
 			.map((phase) => phase.text || "")
@@ -801,6 +964,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					const data = await rpc.request({ type: "get_messages" }, 30_000);
 					if (generation === messagesGeneration) {
 						replaceMessages(data?.messages);
+						messageLogNeedsReconcile = false;
 						if (state.runStartText) {
 							state.runPromptPersisted = state.messages.some((message) =>
 								message?.role === "user" && clean(textOfContent(message.content)).trim() === state.runStartText,
@@ -902,7 +1066,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 
 	const builtinNames = [
 		"new", "compact", "mode", "workspace", "files", "workflow", "todo", "sidebar", "model", "provider",
-		"thinking", "tools", "sessions", "language", "status", "accounts", "touch", "help", "perf", "quit",
+		"thinking", "tools", "skill", "sessions", "language", "status", "update", "accounts", "agents", "team", "touch", "help", "perf", "quit", "interrupt", "steer", "followup", "settings", "config",
 	];
 	const makeBuiltins = () => builtinNames.map((name) => ({
 		name,
@@ -948,7 +1112,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		builtins = makeBuiltins();
 		updateAutocomplete();
 		rebuildWorkflowHistory(state.messages);
-		savePreferences(env?.PI_CODING_AGENT_DIR, { language: next });
+		savePreferences(agentDir, { language: next });
 		toast(t("language.changed", { language: languageName(next) }), "info");
 		tui.requestRender();
 		return true;
@@ -1064,12 +1228,12 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const openStatus = async (force = false) => {
 		clearTerminalSelection();
 		state.pointer.cancel();
-		state.dialog = {
+		replaceDialog({
 			source: "status",
 			kind: "status",
 			title: t("status.title"),
 			message: t("status.loading"),
-		};
+		});
 		tui.requestRender();
 		const queryModel = state.model;
 		try {
@@ -1095,6 +1259,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (state.stopped) return;
 		state.stopped = true;
 		state.authAbort?.abort();
+		extensionDialogs.close();
 		removeSignalHandlers();
 		clearInterval(spinner);
 		if (drawTimer) clearTimeout(drawTimer);
@@ -1112,6 +1277,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (!dialog) return;
 		clearTerminalSelection();
 		state.dialog = undefined;
+		extensionDialogs.available();
 		state.pointer.cancel();
 		if (dialog.kind === "input" || dialog.kind === "editor") {
 			editor.setText(dialog.savedText || "");
@@ -1136,11 +1302,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			tui.requestRender();
 			return;
 		}
-		if (result?.cancelled) rpc.respond({ type: "extension_ui_response", id: dialog.id, cancelled: true });
-		else if (dialog.kind === "confirm") {
-			rpc.respond({ type: "extension_ui_response", id: dialog.id, confirmed: Boolean(result?.confirmed) });
-		} else {
-			rpc.respond({ type: "extension_ui_response", id: dialog.id, value: result?.value });
+		if (dialog.source === "pi") {
+			if (result?.cancelled) extensionDialogs.complete(dialog.id, { cancelled: true });
+			else if (dialog.kind === "confirm") extensionDialogs.complete(dialog.id, { confirmed: Boolean(result?.confirmed) });
+			else extensionDialogs.complete(dialog.id, { value: result?.value });
 		}
 		tui.requestRender();
 	};
@@ -1151,43 +1316,114 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const items = [...builtins, ...state.commands]
 			.filter((item, index, list) => list.findIndex((other) => other.name === item.name) === index)
 			.slice(0, 30);
-		state.dialog = {
+		replaceDialog({
 			source: "palette",
 			kind: "select",
 			title: t("dialog.commands"),
 			options: items.map((item) => item.name),
 			descriptions: new Map(items.map((item) => [item.name, item.description || ""])),
 			selected: 0,
-		};
+		});
 		resetCursorBlink();
 		tui.requestRender();
 	};
 
-	const openLocalSelect = ({ title, message, options, descriptions, selected = 0, kind = "select", onResolve, searchable = false, sections }) => {
+	const openLocalSelect = ({ title, message, options, descriptions, selected = 0, kind = "select", onResolve, searchable, sections, checked, onToggle, applyOption, onApply }) => {
 		clearTerminalSelection();
 		state.pointer.cancel();
-		state.dialog = {
+		replaceDialog({
 			source: "local",
 			kind,
 			title,
 			message,
-			options,
-			allOptions: [...options],
-			descriptions,
+			...selectListState({ options, descriptions, selected, kind, searchable }),
 			sections,
-			searchable,
-			query: "",
-			selected: Math.max(0, Math.min(options.length - 1, selected)),
 			onResolve,
-		};
+			checked,
+			onToggle,
+			applyOption,
+			onApply,
+		});
 		resetCursorBlink();
 		tui.requestRender();
 	};
 	const openLocalInput = ({ title, message, prefill = "", secret = false, onResolve }) => {
 		clearTerminalSelection();
 		state.pointer.cancel();
-		state.dialog = { source: "local", kind: "input", title, message, options: [], selected: 0, savedText: editor.getText(), secret, onResolve };
+		replaceDialog({ source: "local", kind: "input", title, message, options: [], selected: 0, savedText: state.dialog && (state.dialog.kind === "input" || state.dialog.kind === "editor") ? (state.dialog.savedText || "") : editor.getText(), secret, onResolve });
 		editor.setText(prefill); tui.setFocus(editor); resetCursorBlink(); tui.requestRender();
+	};
+
+	let updateCheckPromise;
+	let updatePrompted = false;
+	const openUpdatePrompt = (details) => {
+		if (state.stopped || state.updating || state.dialog) return;
+		const yes = t("action.yes");
+		const no = t("action.no");
+		openLocalSelect({
+			title: t("update.title"),
+			message: formatUpdateDetails(details, { locale }),
+			kind: "confirm",
+			options: [yes, no],
+			descriptions: new Map([[yes, t("update.confirmHint")], [no, t("update.skipHint")]]),
+			onResolve: async (result) => {
+				if (!result?.confirmed) {
+					toast(t("update.skipped"), "info");
+					return;
+				}
+				state.updating = true;
+				replaceDialog({ source: "update", kind: "status", title: t("update.title"), message: t("update.applying"), statusOffset: 0 });
+				tui.requestRender();
+				try {
+					const outcome = await applySourceUpdate({ root: APP_ROOT, update: details, env });
+					if (!outcome.updated) {
+						state.updating = false;
+						clearDialog();
+						toast(t("update.noLongerAvailable"), "info");
+						return;
+					}
+					toast(t("update.updated"), "info", 10_000);
+					setTimeout(() => shutdown(0, { restart: "update" }), 120);
+				} catch (error) {
+					state.updating = false;
+					clearDialog();
+					toast(t("update.failed", { reason: redactText(error?.message || String(error)) }), "error", 10_000);
+				}
+			},
+		});
+	};
+
+	const promptForUpdate = ({ automatic = false } = {}) => {
+		if (automatic && updatePrompted) return Promise.resolve(undefined);
+		if (updateCheckPromise) return updateCheckPromise;
+		const promise = (async () => {
+			try {
+				const details = await checkForUpdates({ root: APP_ROOT, env });
+				if (!details?.available || state.stopped) {
+					if (!automatic && details?.supported === false && !details?.disabled) toast(t("update.unsupported"), "info");
+					return details;
+				}
+				const waitForIdle = () => {
+					if (state.stopped || state.updating) return;
+					if (state.dialog || state.working || state.compacting) {
+						setTimeout(waitForIdle, 250);
+						return;
+					}
+					updatePrompted = true;
+					openUpdatePrompt(details);
+				};
+				waitForIdle();
+				return details;
+			} catch (error) {
+				if (!automatic) toast(t("update.checkFailed", { reason: redactText(error?.message || String(error)) }), "warning", 8_000);
+				return undefined;
+			}
+		})();
+		const tracked = promise.finally(() => {
+			if (updateCheckPromise === tracked) updateCheckPromise = undefined;
+		});
+		updateCheckPromise = tracked;
+		return tracked;
 	};
 
 	const openLanguageSelector = () => {
@@ -1215,7 +1451,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			return resolve(cwd, expanded);
 		}
 		if (env.PI_CODING_AGENT_SESSION_DIR) return resolve(cwd, env.PI_CODING_AGENT_SESSION_DIR);
-		const agentDir = env.PI_CODING_AGENT_DIR || join(process.env.HOME || "", ".tsukuyomi/agent");
+		const agentDir = env.TSUKUYOMI_DIR || env.PI_CODING_AGENT_DIR || join(process.env.HOME || "", ".tsukuyomi/agent");
 		return join(agentDir, "sessions");
 	};
 
@@ -1224,7 +1460,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const options = state.tools.available.length ? [...state.tools.available] : fallback;
 		clearTerminalSelection();
 		state.pointer.cancel();
-		state.dialog = {
+		replaceDialog({
 			source: "tools",
 			kind: "multi",
 			title: t("dialog.tools"),
@@ -1233,7 +1469,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			descriptions: new Map(options.map((name) => [name, state.tools.labels[name] || t(TOOL_LABEL_KEYS[name] || name)])),
 			selected: 0,
 			toggled: new Map(),
-		};
+		});
 		resetCursorBlink();
 		tui.requestRender();
 	};
@@ -1259,6 +1495,24 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		tui.requestRender();
 	};
 
+	const toggleDialogOption = (option) => {
+		const dialog = state.dialog;
+		if (!dialog || dialog.kind !== "multi" || !dialog.options.includes(option)) return;
+		if (dialog.applyOption === option) {
+			try {
+				const task = dialog.onApply?.();
+				if (task && typeof task.catch === "function") task.catch((error) => toast(error.message || String(error), "error"));
+			} catch (error) {
+				toast(error.message || String(error), "error");
+			}
+			return;
+		}
+		if (dialog.onToggle) dialog.onToggle(option);
+		else toggleDialogTool(option);
+		resetCursorBlink();
+		tui.requestRender();
+	};
+
 	const openSessionsDialog = async () => {
 		toast(t("session.loading"), "info", 2_000);
 		const items = await scanSessionCatalog(sessionsRoot(), { cwd, limit: 500 });
@@ -1269,7 +1523,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const currentIndex = items.findIndex((item) => item.path === state.sessionFile);
 		clearTerminalSelection();
 		state.pointer.cancel();
-		state.dialog = {
+		replaceDialog({
 			source: "local",
 			kind: "sessions",
 			title: t("dialog.sessions"),
@@ -1277,7 +1531,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			currentOnly: false,
 			selected: Math.max(0, currentIndex),
 			items,
-		};
+		});
 		resetCursorBlink();
 		tui.requestRender();
 	};
@@ -1339,6 +1593,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		tui.requestRender();
 	};
 
+	const cycleModel = async (direction = 1) => {
+		const models = await availableModels();
+		if (!models.length) { toast(t("toast.noModels"), "warning"); return; }
+		const current = models.findIndex((model) => model.provider === state.model?.provider && model.id === state.model?.id);
+		const next = (current + direction + models.length) % models.length;
+		await applyModel(models[next]);
+	};
+
 	const openModelSelector = async () => {
 		toast(t("toast.loadingModels"), "info", 2_000);
 		const models = await availableModels();
@@ -1371,7 +1633,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const abort = () => {
 			if (state.dialog === ownedDialog) {
 				if (ownedDialog?.kind === "input") editor.setText(ownedDialog.savedText || "");
-				state.dialog = undefined; tui.requestRender();
+				clearDialog(); tui.requestRender();
 			}
 			reject(new Error("Cancelled"));
 		};
@@ -1396,7 +1658,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const controller = new AbortController(); state.authAbort = controller;
 		const closeAuthDialog = () => {
 			if (state.dialog?.authPrompt) editor.setText(state.dialog.savedText || "");
-			if (state.dialog?.source === "auth" || state.dialog?.authPrompt) state.dialog = undefined;
+			if (state.dialog?.source === "auth" || state.dialog?.authPrompt) clearDialog();
 		};
 		const showAuthProgress = ({ url, code, instructions }) => {
 			if (url) openUrl(url);
@@ -1405,7 +1667,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				code ? t("auth.deviceCode", { code, url: url || "" }) : "",
 				instructions || t("auth.waiting"),
 			].filter(Boolean);
-			state.dialog = {
+			replaceDialog({
 				kind: "select",
 				source: "auth",
 				title: t("dialog.providerSignIn"),
@@ -1415,7 +1677,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				onResolve: (result) => {
 					if (result?.cancelled || result?.value) controller.abort();
 				},
-			};
+			});
 			tui.requestRender();
 		};
 		try {
@@ -1590,6 +1852,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 
 	const openAccounts = async () => {
 		migrateAllCurrentCredentials(agentDir);
+		try {
+			const codex = syncCodexCredential(agentDir);
+			if (codex?.activated || codex?.updated) {
+				providers().invalidate();
+				usageClient.clear();
+			}
+		} catch { /* Codex import is best-effort */ }
 		let providerList = [];
 		try { providerList = await providers().providers(); } catch { /* listing must still work when the kernel is unavailable */ }
 		const providerById = new Map(providerList.map((provider) => [provider.id, provider]));
@@ -1632,6 +1901,375 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		});
 	};
 
+	const editAgent = async (existing) => {
+		let models;
+		try { models = await availableModels(); } catch { return; }
+		if (!models.length) { toast(locale === "zh" ? "没有可用模型" : "No models available", "warning"); return; }
+		const modelLabels = models.map((model) => `${model.provider}/${model.id}`);
+		const currentModel = existing?.provider && existing?.model ? `${existing.provider}/${existing.model}` : undefined;
+		openLocalInput({
+			title: locale === "zh" ? "Agent 名称" : "Agent name",
+			prefill: existing?.name || "",
+			onResolve: (nameResult) => {
+				const name = nameResult?.value?.trim(); if (!name) return;
+				openLocalSelect({
+					title: locale === "zh" ? "Agent 模型" : "Agent model",
+					message: locale === "zh" ? "每个 Agent 可独立选择供应商和模型" : "Each agent can use an independent provider and model",
+					options: modelLabels,
+					selected: Math.max(0, modelLabels.indexOf(currentModel)),
+					searchable: true,
+					onResolve: (modelResult) => {
+						const model = models[modelLabels.indexOf(modelResult?.value)]; if (!model) return;
+						const accounts = listAllAccounts(agentDir).filter((entry) => entry.providerId === model.provider);
+						const accountLabels = [locale === "zh" ? "使用当前账户" : "Use current account", ...accounts.map((entry) => entry.name || entry.id)];
+						openLocalSelect({
+							title: locale === "zh" ? "绑定账户" : "Bind account",
+							options: accountLabels,
+							onResolve: (accountResult) => {
+								const accountIndex = accountLabels.indexOf(accountResult?.value) - 1;
+								const accountRef = accountIndex >= 0 ? { providerId: model.provider, id: accounts[accountIndex].id } : undefined;
+								const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+								openLocalSelect({
+									title: locale === "zh" ? "思考强度" : "Thinking level",
+									options: levels,
+									selected: Math.max(0, levels.indexOf(existing?.thinking || "medium")),
+									onResolve: (thinkingResult) => {
+										if (!thinkingResult?.value) return;
+										openLocalInput({
+											title: locale === "zh" ? "独立系统提示词" : "Independent system prompt",
+											message: locale === "zh" ? "可留空；Alt+Enter 换行" : "Optional · Alt+Enter for a newline",
+											prefill: existing?.systemPrompt || "",
+											onResolve: (promptResult) => {
+								const saved = saveAgent(agentDir, {
+									...existing, name, provider: model.provider, model: model.id, accountRef,
+									thinking: thinkingResult.value, systemPrompt: promptResult?.value || "",
+								});
+												toast(`${saved.name} ${locale === "zh" ? "已保存" : "saved"}`, "info");
+											},
+										});
+									},
+								});
+							},
+						});
+					},
+				});
+			},
+		});
+	};
+
+	const openAgents = () => {
+		const agents = listAgents(agentDir);
+		const create = locale === "zh" ? "＋ 新建 Agent" : "＋ New agent";
+		const labels = [...agents.map((agent) => `${agent.name} · ${agent.provider}/${agent.model}`), create];
+		openLocalSelect({
+			title: "Agents",
+			message: locale === "zh" ? "选择、编辑或删除可复用 Agent" : "Activate, edit, or delete reusable agents",
+			options: labels,
+			descriptions: new Map(agents.map((agent, index) => [labels[index], `${agent.thinking} · ${agent.accountRef ? (locale === "zh" ? "独立账户" : "bound account") : (locale === "zh" ? "当前账户" : "current account")} · ${agent.description || agent.id}`])),
+			searchable: true,
+			onResolve: (result) => {
+				if (result?.value === create) { void editAgent(); return; }
+				const agent = agents[labels.indexOf(result?.value)]; if (!agent) return;
+				const activateLabel = locale === "zh" ? "启用" : "Activate";
+				const editLabel = locale === "zh" ? "编辑" : "Edit";
+				const deleteLabel = locale === "zh" ? "删除" : "Delete";
+				openLocalSelect({ title: agent.name, message: `${agent.provider}/${agent.model} · ${agent.thinking}`, options: [activateLabel, editLabel, deleteLabel], onResolve: (action) => {
+					if (action?.value === activateLabel) void runInput(`/kagent use ${agent.id}`);
+					else if (action?.value === editLabel) void editAgent(getAgent(agentDir, agent.id));
+					else if (action?.value === deleteLabel && deleteAgent(agentDir, agent.id)) toast(`${agent.name} ${locale === "zh" ? "已删除" : "deleted"}`, "info");
+				} });
+			},
+		});
+	};
+
+	const openSkills = (query = "") => {
+		// This catalog is intentionally independent of PI's registered commands.
+		// Disabled skills are not registered by PI, but must remain visible here so
+		// the user can turn them back on.
+		const discovered = discoverSkills(agentDir);
+		managedSkills = discovered.skills;
+		skillDiagnostics.length = 0;
+		skillDiagnostics.push(...discovered.diagnostics);
+		disabledSkills = new Set(loadSkillSettings(agentDir).disabled);
+		const normalized = query.trim().toLowerCase();
+		const skills = managedSkills
+			.filter((skill) => !normalized || skill.name.toLowerCase().includes(normalized) || skill.description?.toLowerCase().includes(normalized))
+			.sort((a, b) => a.name.localeCompare(b.name));
+		if (!skills.length) {
+			toast(locale === "zh" ? (normalized ? "没有匹配的 Skill" : "没有发现 Skill") : (normalized ? "No matching skills" : "No Tsukuyomi skills discovered"), "warning");
+			return;
+		}
+		const labels = skills.map((skill) => skill.name);
+		const apply = locale === "zh" ? "✓ 应用并重启内核" : "✓ Apply and restart kernel";
+		const pending = new Map(skills.map((skill) => [skill.name, !disabledSkills.has(skill.name)]));
+		const descriptions = new Map(skills.map((skill) => [skill.name,
+			`${skill.description || ""} · ${compactPath(skill.filePath)}${disabledSkills.has(skill.name) ? (locale === "zh" ? " · 当前关闭" : " · disabled") : (locale === "zh" ? " · 当前开启" : " · enabled")}`,
+		]));
+		descriptions.set(apply, locale === "zh" ? "保存选择，重启 PI 内核后立即生效" : "Save the selection and restart the PI kernel to apply it");
+		openLocalSelect({
+			title: locale === "zh" ? "Skills（Tsukuyomi 管理）" : "Skills (managed by Tsukuyomi)",
+			message: locale === "zh" ? "空格切换开启/关闭；选择最后一项应用。关闭的 Skill 不会加载到模型上下文，也不能通过 /skill:name 调用。" : "Space toggles enablement; choose the last item to apply. Disabled skills are not loaded or invokable.",
+			options: [...labels, apply],
+			descriptions,
+			searchable: true,
+			checked: (name) => pending.get(name) === true,
+			onToggle: (name) => {
+				if (pending.has(name)) pending.set(name, !pending.get(name));
+			},
+			applyOption: apply,
+			onApply: () => {
+				if (state.working || state.compacting) {
+					toast(locale === "zh" ? "请等待当前运行结束后再切换 Skill" : "Wait for the current run to finish before changing skills", "warning");
+					return;
+				}
+				const known = new Set(skills.map((skill) => skill.name));
+				const nextDisabled = [
+					...disabledSkills,
+					...skills.filter((skill) => !pending.get(skill.name)).map((skill) => skill.name),
+				].filter((name, index, values) => (!known.has(name) || !pending.has(name)) && values.indexOf(name) === index).sort();
+				const before = [...disabledSkills].sort();
+				if (JSON.stringify(before) === JSON.stringify(nextDisabled)) {
+					clearDialog();
+					tui.requestRender();
+					return;
+				}
+				if (!saveSkillSettings(agentDir, { disabled: nextDisabled })) {
+					toast(locale === "zh" ? "Skill 配置保存失败" : "Could not save skill configuration", "error");
+					return;
+				}
+				disabledSkills = new Set(nextDisabled);
+				clearDialog();
+				toast(locale === "zh" ? "Skill 配置已保存，正在重启内核…" : "Skill configuration saved; restarting kernel…", "info", 6_000);
+				setTimeout(() => shutdown(0, { restart: "skills", session: state.sessionFile, workspace: cwd }), 120);
+			},
+		});
+	};
+
+	const sendTeamCommand = (verb, payload = {}) => runInput(`/kteam ${verb} ${JSON.stringify(payload)}`);
+	const configureTeamMembers = ({ ids, objective, collaborationMode, leaderId, verb }) => {
+		const memberProfiles = {};
+		const available = listAgents(agentDir);
+		const configure = (index) => {
+			if (index >= ids.length) {
+				if (verb === "start") void sendTeamCommand("start", { agentIds: ids, objective, collaborationMode, leaderId, memberProfiles });
+				else void sendTeamCommand("join", { agentIds: ids, memberProfiles });
+				return;
+			}
+			const id = ids[index];
+			if (id === leaderId) {
+				memberProfiles[id] = { profile: "plan", isolation: "current-readonly" };
+				configure(index + 1);
+				return;
+			}
+			const agent = available.find((item) => item.id === id);
+			const research = locale === "zh" ? "研究 · 只读" : "Research · read-only";
+			const review = locale === "zh" ? "审查 · 只读" : "Review · read-only";
+			const build = locale === "zh" ? "构建 · 可写" : "Build · writable";
+			const profileByLabel = new Map([[research, "research"], [review, "review"], [build, "build"]]);
+			openLocalSelect({
+				title: `${locale === "zh" ? "配置成员" : "Configure member"}: ${agent?.name || id}`,
+				message: locale === "zh" ? "权限配置独立于文件隔离方式" : "Permission profile is independent from filesystem isolation",
+				options: [research, review, build],
+				descriptions: new Map([
+					[research, locale === "zh" ? "读取、搜索和汇报，不修改文件" : "Read, search, and report without file changes"],
+					[review, locale === "zh" ? "只读审查和验证" : "Read-only review and validation"],
+					[build, locale === "zh" ? "允许实现；需要 worktree 或共享写租约" : "Implement changes in a worktree or under the shared-write lease"],
+				]),
+				onResolve: (profileResult) => {
+					const profile = profileByLabel.get(profileResult?.value);
+					if (!profile) return;
+					if (profile !== "build") {
+						memberProfiles[id] = { profile, isolation: "current-readonly" };
+						configure(index + 1);
+						return;
+					}
+					const worktree = locale === "zh" ? "Git Worktree · 隔离" : "Git worktree · isolated";
+					const shared = locale === "zh" ? "Shared write · 单写者租约" : "Shared write · single-writer lease";
+					openLocalSelect({
+						title: locale === "zh" ? "构建隔离" : "Build isolation",
+						message: locale === "zh" ? "共享写入可在 Git 或非 Git 目录直接写入，但同一时间只有获得租约的成员可以写文件" : "Shared writes work in Git and non-Git directories; an explicit lease allows only one member to write at a time",
+						options: [worktree, shared],
+						onResolve: (isolationResult) => {
+							if (!isolationResult?.value) return;
+							memberProfiles[id] = { profile: "build", isolation: isolationResult.value === shared ? "shared-write" : "git-worktree" };
+							configure(index + 1);
+						},
+					});
+				},
+			});
+		};
+		configure(0);
+	};
+	const pickTeamAgents = ({ candidates, verb, objective }) => {
+		const picked = new Set();
+		const show = () => {
+			const rows = candidates.map((agent) => `${picked.has(agent.id) ? "●" : "○"} ${agent.name} · ${agent.provider}/${agent.model}`);
+			const done = `${locale === "zh" ? "继续" : "Continue"} (${picked.size})`;
+			openLocalSelect({
+				title: verb === "kick" ? (locale === "zh" ? "移出 Agent" : "Kick agents") : (locale === "zh" ? "选择 Agent" : "Select agents"),
+				message: locale === "zh" ? "逐个切换成员，然后选择继续" : "Toggle members one by one, then choose Continue",
+				options: [...rows, done],
+				onResolve: (result) => {
+					if (result?.value === done) {
+						if (!picked.size) { toast(locale === "zh" ? "请至少选择一个 Agent" : "Select at least one agent", "warning"); return; }
+						if (verb === "start") {
+							openLocalInput({ title: locale === "zh" ? "团队目标" : "Team objective", prefill: objective || "", onResolve: (input) => {
+								if (!input?.value?.trim()) return;
+								const ids = [...picked];
+								const peer = locale === "zh" ? "Peer · 平等协作" : "Peer · equal collaboration";
+								const leader = locale === "zh" ? "Leader · 独立规划 + 用户批准" : "Leader · independent plan + user approval";
+								openLocalSelect({
+									title: locale === "zh" ? "团队协作模式" : "Collaboration mode",
+									options: [peer, leader],
+									descriptions: new Map([[peer, locale === "zh" ? "成员通过 broker 讨论并按各自权限协作" : "Members discuss through the broker with their granted profiles"], [leader, locale === "zh" ? "独立 Leader 先规划，执行前必须由用户批准" : "A separate leader plans first; execution requires explicit user approval"]]),
+									onResolve: (modeResult) => {
+										if (modeResult?.value === peer) configureTeamMembers({ ids, objective: input.value.trim(), collaborationMode: "peer", verb: "start" });
+										else if (modeResult?.value === leader) {
+											const available = listAgents(agentDir);
+											const labels = ids.map((id) => `${available.find((item) => item.id === id)?.name || id} · ${id}`);
+											openLocalSelect({ title: locale === "zh" ? "选择独立 Leader" : "Select planning leader", options: labels, onResolve: (leaderResult) => {
+												const leaderIndex = labels.indexOf(leaderResult?.value);
+													if (leaderIndex >= 0) configureTeamMembers({ ids, objective: input.value.trim(), collaborationMode: "leader", leaderId: ids[leaderIndex], verb: "start" });
+												} });
+										}
+								},
+								});
+							} });
+						} else configureTeamMembers({ ids: [...picked], objective: undefined, collaborationMode: state.team?.collaborationMode || "peer", verb });
+						return;
+					}
+					const index = rows.indexOf(result?.value);
+					if (index >= 0) { const id = candidates[index].id; if (picked.has(id)) picked.delete(id); else picked.add(id); show(); }
+				},
+			});
+		};
+		show();
+	};
+	const openTeamActions = () => {
+		const agents = listAgents(agentDir);
+		if (!agents.length) { toast(locale === "zh" ? "请先用 /agents 创建 Agent" : "Create agents with /agents first", "warning"); return; }
+		if (!state.team?.active) { pickTeamAgents({ candidates: agents, verb: "start" }); return; }
+		const join = locale === "zh" ? "加入 Agent" : "Join agents";
+		const kick = locale === "zh" ? "移出 Agent" : "Kick agents";
+		const approve = locale === "zh" ? "批准 Leader 计划" : "Approve leader plan";
+		const takeover = locale === "zh" ? "手动接任 Leader" : "Take over as leader";
+		const stop = locale === "zh" ? "停止团队" : "Stop team";
+		const pendingPermissions = (state.team.permissionRequests || []).filter((request) => request.status === "pending");
+		const permissionLabels = pendingPermissions.map((request) => `${locale === "zh" ? "处理权限" : "Resolve permission"} · ${request.memberId} · ${request.kind}`);
+		const actions = [...permissionLabels];
+		if (state.team.phase === "awaiting_approval") actions.push(approve);
+		if (state.team.phase === "paused" && state.team.collaborationMode === "leader") actions.push(takeover);
+		actions.push(join, kick, stop);
+		openLocalSelect({ title: "Agent Team", message: `${state.team.collaborationMode || "peer"} · ${state.team.phase || "stopped"}\n${state.team.objective}`, options: actions, onResolve: (result) => {
+			const permissionIndex = permissionLabels.indexOf(result?.value);
+			if (permissionIndex >= 0) {
+				const request = pendingPermissions[permissionIndex];
+				const yes = locale === "zh" ? "批准" : "Approve";
+				const no = locale === "zh" ? "拒绝" : "Deny";
+				openLocalSelect({ title: result.value, options: [yes, no], onResolve: (choice) => {
+					if (choice?.value === yes || choice?.value === no) void sendTeamCommand("permission", { requestId: request.id, approved: choice.value === yes });
+				} });
+				return;
+			}
+			if (result?.value === approve) { void sendTeamCommand("approve"); return; }
+			if (result?.value === takeover) {
+				const members = new Set(state.team.members.map((member) => member.id));
+				const candidates = agents.filter((agent) => !members.has(agent.id));
+				openLocalSelect({ title: locale === "zh" ? "选择接任 Leader" : "Select replacement leader", options: candidates.map((agent) => `${agent.name} · ${agent.id}`), onResolve: (choice) => {
+					const agent = candidates.find((item) => `${item.name} · ${item.id}` === choice?.value);
+					if (agent) void sendTeamCommand("takeover", { agentId: agent.id });
+				} });
+				return;
+			}
+			if (result?.value === join) {
+				const ids = new Set(state.team.members.map((member) => member.id));
+				pickTeamAgents({ candidates: agents.filter((agent) => !ids.has(agent.id)), verb: "join" });
+			} else if (result?.value === kick) {
+				const byId = new Map(agents.map((agent) => [agent.id, agent]));
+				pickTeamAgents({ candidates: state.team.members.map((member) => byId.get(member.id) || member), verb: "kick" });
+			} else if (result?.value === stop) void sendTeamCommand("stop");
+		} });
+	};
+
+	const showHubTask = async (job) => {
+		const fresh = await taskClient.request("get", { id: job.id });
+		if (fresh?.cwd !== cwd) { toast(t("toast.workspaceUnreadable", { path: job.cwd || "" }), "error"); return; }
+		const isRunning = !fresh.endedAt && ["running", "queued"].includes(fresh.status);
+		const view = locale === "zh" ? "查看输出" : "View output";
+		const cancel = locale === "zh" ? "取消任务" : "Cancel task";
+		const steer = locale === "zh" ? "纠正任务" : "Steer task";
+		const apply = locale === "zh" ? "检查并应用补丁" : "Check and apply patch";
+		const actions = [view, ...(isRunning ? [cancel, ...(fresh.kind === "subagent" && fresh.status === "running" ? [steer] : [])] : []), ...(fresh.kind === "subagent" && fresh.status === "done" && fresh.patchPath ? [apply] : [])];
+		openLocalSelect({ title: fresh.command || fresh.kind, message: `${fresh.status} · ${fresh.profile || (fresh.readonly ? "read-only" : "—")} · ${fresh.patchPath || "—"}`, options: actions, onResolve: (answer) => {
+			if (answer?.value === view) {
+				replaceDialog({ source: "local", kind: "status", title: fresh.command || "Task", message: redactText((fresh.kind === "pty" ? fresh.screen || fresh.output : fresh.output || fresh.result) || "—").slice(-50_000), statusOffset: 0, onResolve: () => { void openAgentHub(); } });
+			} else if (answer?.value === steer) {
+				openLocalInput({ title: steer, onResolve: (result) => result?.value?.trim() && taskClient.request("steer", { id: fresh.id, message: result.value.trim() }).catch((error) => toast(error.message, "error")) });
+			} else if (answer?.value === cancel || answer?.value === apply) {
+				openLocalSelect({ title: answer.value, kind: "confirm", options: [t("action.yes"), t("action.no")], selected: 1,
+					onResolve: async (choice) => {
+						if (!choice?.confirmed) return;
+						const latest = await taskClient.request("get", { id: fresh.id });
+						if (latest.cwd !== cwd || (answer.value === cancel ? Boolean(latest.endedAt) : latest.status !== "done" || !latest.patchPath)) throw new Error("Task state changed; reopen the Hub");
+						await taskClient.request(answer.value === cancel ? "cancel" : "apply", { id: fresh.id });
+						toast(answer.value === cancel ? (locale === "zh" ? "任务已取消" : "Task cancelled") : (locale === "zh" ? "补丁已应用" : "Patch applied"), "info");
+					},
+				});
+			}
+		} });
+	};
+	const openAgentHub = async () => {
+		const jobs = await taskClient.request("list").catch(() => []);
+		const rows = buildAgentHubRows({ team: state.team, jobs: Array.isArray(jobs) ? jobs : [], agents: listAgents(agentDir), cwd, locale });
+		const options = rows.map((row, index) => `${row.kind.toUpperCase()}  ${row.title}  · ${index + 1}`);
+		openLocalSelect({ title: locale === "zh" ? "Agent Hub · 团队与任务" : "Agent Hub · Team & tasks", options, searchable: true,
+			descriptions: new Map(rows.map((row, index) => [options[index], row.detail])),
+			onResolve: (result) => {
+				const row = rows[options.indexOf(result?.value)];
+				if (!row) return;
+				if (row.kind === "task") void showHubTask(row.data).catch((error) => toast(error.message, "error"));
+				else if (row.kind === "permission") {
+					openLocalSelect({ title: row.title, message: row.detail, kind: "confirm", options: [t("action.yes"), t("action.no")], selected: 1, onResolve: (choice) => {
+						if (choice?.cancelled) return;
+						if (!state.team?.permissionRequests?.some((request) => request.id === row.id && request.status === "pending")) { toast("Permission request expired", "warning"); return; }
+						void sendTeamCommand("permission", { requestId: row.id, approved: Boolean(choice.confirmed) });
+					} });
+				} else if (row.kind === "agent") openAgents();
+				else if (row.kind === "member" || row.kind === "summary") openTeamActions();
+				else if (row.kind === "report") replaceDialog({ source: "local", kind: "status", title: row.title, message: redactText(row.data?.text || row.detail).slice(-50_000), statusOffset: 0, onResolve: () => { void openAgentHub(); } });
+			},
+		});
+		if (state.dialog?.source === "local" && state.dialog.title?.startsWith("Agent Hub")) {
+			state.dialog.kind = "hub";
+			state.dialog.hubRows = rows;
+			state.dialog.hubOptions = options;
+			state.dialog.hubJobs = Array.isArray(jobs) ? jobs : [];
+		}
+	};
+	const refreshHubDialog = (job) => {
+		const dialog = state.dialog;
+		if (dialog?.kind !== "hub") return;
+		if (job) {
+			const index = dialog.hubJobs.findIndex((item) => item.id === job.id);
+			if (index >= 0) dialog.hubJobs[index] = job;
+			else dialog.hubJobs.push(job);
+			if (dialog.hubJobs.length > 200) dialog.hubJobs.splice(0, dialog.hubJobs.length - 200);
+		}
+		const selectedOption = dialog.options[dialog.selected];
+		const selectedItem = dialog.hubRows?.[dialog.hubOptions?.indexOf(selectedOption)];
+		const rows = buildAgentHubRows({ team: state.team, jobs: dialog.hubJobs, agents: listAgents(agentDir), cwd, locale });
+		const options = rows.map((row, index) => `${row.kind.toUpperCase()}  ${row.title}  · ${index + 1}`);
+		dialog.hubRows = rows;
+		dialog.hubOptions = options;
+		dialog.allOptions = options;
+		dialog.descriptions = new Map(rows.map((row, index) => [options[index], row.detail]));
+		dialog.options = filterSelectOptions(options, dialog.descriptions, dialog.query);
+		const selected = rows.findIndex((item) => item.kind === selectedItem?.kind && item.id === selectedItem?.id);
+		dialog.selected = Math.max(0, Math.min(dialog.options.length - 1, dialog.options.indexOf(options[selected])));
+		tui.requestRender();
+	};
+	const openTeam = () => { void openAgentHub().catch((error) => toast(error.message, "error")); };
+
 	const availableThinkingLevels = async () => {
 		const data = await request({ type: "get_available_thinking_levels" }, { timeoutMs: 30_000 });
 		return Array.isArray(data?.levels) ? data.levels.filter((level) => typeof level === "string") : [];
@@ -1642,6 +2280,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		state.thinking = level;
 		toast(t("toast.thinking", { level }), "info");
 		tui.requestRender();
+	};
+
+	const cycleThinkingLevel = async () => {
+		const levels = await availableThinkingLevels();
+		if (!levels.length) { toast(t("toast.noThinking"), "warning"); return; }
+		const current = levels.indexOf(state.thinking);
+		await applyThinkingLevel(levels[(current + 1) % levels.length]);
 	};
 
 	const openThinkingSelector = async () => {
@@ -1760,25 +2405,15 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const command = rawCommand.toLowerCase();
 		const rest = tail.join(" ");
 		if (command === "tasks") {
-			try {
-				const jobs = await taskClient.request("list");
-				const labels = jobs.map((job) => `${job.status} · ${job.kind} · ${job.command} · ${job.cwd}`);
-				openLocalSelect({ title: locale === "zh" ? "任务" : "Tasks", options: labels, onResolve: (result) => {
-					const job = jobs[labels.indexOf(result?.value)]; if (!job) return;
-					openLocalSelect({ title: job.command, options: ["View / 查看", "Cancel / 取消", "Steer / 纠正"], onResolve: async (choice) => {
-						if (choice?.value?.startsWith("Cancel")) await taskClient.request("cancel", { id: job.id });
-						else if (choice?.value?.startsWith("Steer")) openLocalInput({ title: "Steer / 纠正", onResolve: (input) => input?.value && taskClient.request("steer", { id: job.id, message: input.value }) });
-						else if (choice?.value) {
-							if (job.cwd !== cwd) chooseWorkspace(job.cwd);
-							else { const tool = state.liveTools.get(job.toolCallId); if (tool) { tool.expanded = true; tool.offset = 0; state.dirtyToolIds.add(job.toolCallId); state.workflowRevision++; } resetTranscript(); }
-						}
-					} });
-				} });
-			} catch (error) { toast(error.message, "error"); }
+			try { await openAgentHub(); } catch (error) { toast(error.message, "error"); }
 			return;
 		}
 		if (command === "followup") return runInput(rest, "followUp");
 		if (command === "steer") return runInput(rest, "steer");
+		if (command === "interrupt") {
+			if (!rest) { toast(t("toast.interruptUsage"), "warning"); return; }
+			return interruptAndSend(rest);
+		}
 		if (command === "quit" || command === "exit") return shutdown(0);
 		if (command === "help") {
 			toast(t("toast.help"), "info", 10_000);
@@ -1817,8 +2452,22 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (command === "workspace") return chooseWorkspace(rest);
 		if (command === "language" || command === "lang") return rest ? setLocale(rest) : openLanguageSelector();
 		if (command === "status") return openStatus(["refresh", "force"].includes(rest.toLowerCase()));
+		if (command === "settings" || command === "config") { activate(); return openSettings(); }
+		if (command === "update") return promptForUpdate();
 		if (command === "accounts" || command === "account") {
 			try { await openAccounts(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); }
+			return;
+		}
+		if (command === "agents" || command === "agent") {
+			try { openAgents(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); }
+			return;
+		}
+		if (command === "skill" || command === "skills") {
+			openSkills(rest);
+			return;
+		}
+		if (command === "team") {
+			try { openTeam(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); }
 			return;
 		}
 		if (command === "new") {
@@ -1912,31 +2561,159 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				message: raw,
 				streamingBehavior,
 			}, { timeoutMs: 30_000 });
-			await refreshMessages();
+			// The kernel emits the user message's `message_end`, which
+			// appendFinalMessage folds in; no snapshot round-trip is needed here.
 		} catch { editor.setText(raw); }
+	};
+
+	// Grok Build-style interject: forcibly stop the in-flight turn (and drop
+	// anything queued), then start a fresh turn with this prompt immediately.
+	const waitForIdle = (timeoutMs = 4_000) => new Promise((resolve) => {
+		const startedAt = Date.now();
+		const check = () => {
+			if (!state.working || Date.now() - startedAt >= timeoutMs) resolve();
+			else setTimeout(check, 30);
+		};
+		check();
+	});
+	const interruptAndSend = async (raw) => {
+		const value = String(raw ?? "").trim();
+		if (!value) return;
+		editor.addToHistory(value);
+		activate();
+		resetTranscript();
+		state.runStartText = value;
+		state.runStartAt = Date.now();
+		state.runPromptPersisted = false;
+		state.runStartIndex = undefined;
+		state.runWorkSince = Date.now();
+		state.runThoughtMs = 0;
+		state.thinkingPhaseStart = undefined;
+		state.lastThoughtMs = undefined;
+		state.lastWorkMs = undefined;
+		state.working = true;
+		editor.setText("");
+		tui.requestRender();
+		try { await rpc.request({ type: "clear_queue" }, 10_000); } catch {}
+		try { await rpc.request({ type: "abort" }, 30_000); } catch {}
+		await waitForIdle();
+		try {
+			await request({ type: "prompt", message: value }, { timeoutMs: 30_000 });
+		} catch {
+			state.working = false;
+			editor.setText(value);
+			tui.requestRender();
+		}
 	};
 
 	editor.onChange = () => resetCursorBlink();
 	editor.onSubmit = (value) => { void runInput(value); };
 
+	const settingsBool = (value) => value ? t("settings.on") : t("settings.off");
+	const settingsGroups = () => ([
+		{ header: t("settings.groupInterface"), items: [
+			{ id: "language", label: t("settings.language"), detail: languageName() },
+			{ id: "sidebar", label: t("settings.rightSidebar"), detail: settingsBool(state.showWorkflow || state.showTodos), toggle: true },
+			{ id: "thinking", label: t("settings.thinking"), detail: settingsBool(state.thinkingAutoCollapse), toggle: true },
+			{ id: "markdown", label: t("settings.markdown"), detail: settingsBool(state.markdown), toggle: true },
+			{ id: "touch", label: t("settings.touch"), detail: settingsBool(state.touchMode), toggle: true },
+			{ id: "keybindings", label: t("settings.keybindings"), detail: t(state.keybindingPreset === "omp" ? "settings.keybindingsOmp" : "settings.keybindingsLegacy") },
+			{ id: "mode", label: t("command.mode"), detail: t(`mode.${state.mode}`) },
+		] },
+		{ header: t("settings.groupAuth"), items: [
+			{ id: "provider", label: t("settings.provider"), detail: state.model?.provider || t("status.notAvailable") },
+			{ id: "accounts", label: t("settings.accounts"), detail: t("settings.accountsHint") },
+			{ id: "model", label: t("settings.model"), detail: state.model?.id || t("status.noModel") },
+			{ id: "thinkingLevel", label: t("command.thinking"), detail: state.thinking },
+		] },
+		{ header: t("settings.groupSession"), items: [
+			{ id: "new", label: t("command.new") },
+			{ id: "sessions", label: t("command.sessions") },
+			{ id: "compact", label: t("command.compact") },
+		] },
+		{ header: t("settings.groupTools"), items: [
+			{ id: "tools", label: t("command.tools") },
+			{ id: "skills", label: t("command.skill") },
+			{ id: "agents", label: t("command.agents") },
+			{ id: "team", label: t("command.team") },
+		] },
+		{ header: t("settings.groupAbout"), items: [
+			{ id: "status", label: t("command.status") },
+			{ id: "update", label: t("command.update") },
+			{ id: "help", label: t("command.help") },
+			{ id: "version", label: t("settings.version"), detail: `v${version}` },
+		] },
+	]);
+	const buildSettingsRows = () => {
+		const rows = [];
+		const items = [];
+		for (const group of settingsGroups()) {
+			rows.push({ type: "header", label: group.header });
+			for (const item of group.items) {
+				item.index = items.length;
+				items.push(item);
+				rows.push({ type: "item", item });
+			}
+		}
+		return { rows, items };
+	};
+	const refreshSettingsRows = () => {
+		const dialog = state.dialog;
+		if (dialog?.kind !== "settings") return;
+		const { rows, items } = buildSettingsRows();
+		dialog.settingsRows = rows;
+		dialog.items = items;
+		dialog.selected = Math.max(0, Math.min(items.length - 1, dialog.selected || 0));
+	};
+	const runSettingsAction = (id) => {
+		const close = () => { clearDialog(); };
+		switch (id) {
+			case "language": close(); openLanguageSelector(); break;
+			case "sidebar": { const next = !(state.showWorkflow || state.showTodos); state.showWorkflow = next; state.showTodos = next; savePreferences(agentDir, { rightSidebarDefault: next }); break; }
+			case "thinking": state.thinkingAutoCollapse = !state.thinkingAutoCollapse; savePreferences(agentDir, { thinkingAutoCollapse: state.thinkingAutoCollapse }); break;
+			case "markdown": state.markdown = !state.markdown; savePreferences(agentDir, { markdown: state.markdown }); rebuildWorkflowHistory(state.messages); break;
+			case "touch": state.touchMode = !state.touchMode; state.pointer.cancel(); savePreferences(agentDir, { touchMode: state.touchMode }); break;
+			case "keybindings": {
+				state.keybindingPreset = state.keybindingPreset === "omp" ? "legacy" : "omp";
+				activeKeybindings = resolveTuiKeybindings(state.keybindingPreset, preferences.keybindingOverrides);
+				savePreferences(agentDir, { keybindingPreset: state.keybindingPreset });
+				break;
+			}
+			case "mode": close(); void nextMode(); break;
+			case "provider": close(); void openProviderSelector().catch((error) => toast(error?.message || String(error), "error")); break;
+			case "accounts": close(); void openAccounts().catch((error) => toast(error?.message || String(error), "error")); break;
+			case "model": close(); void openModelSelector().catch((error) => toast(error?.message || String(error), "error")); break;
+			case "thinkingLevel": close(); void openThinkingSelector().catch((error) => toast(error?.message || String(error), "error")); break;
+			case "new": close(); void runInput("/new"); break;
+			case "sessions": close(); void openSessionsDialog(); break;
+			case "compact": close(); void runInput("/compact"); break;
+			case "tools": close(); openToolsDialog(); break;
+			case "skills": close(); openSkills(); break;
+			case "agents": close(); openAgents(); break;
+			case "team": close(); openTeam(); break;
+			case "status": close(); void openStatus(false); break;
+			case "update": close(); void promptForUpdate({ automatic: false }); break;
+			case "help": close(); toast(t("toast.help"), "info", 10_000); break;
+			default: break;
+		}
+		refreshSettingsRows();
+		tui.requestRender();
+	};
 	const openSettings = () => {
-		const options = [t("settings.language"), t("settings.rightSidebar"), t("settings.thinking"), t("settings.touch"), t("settings.markdown")];
-		openLocalSelect({ title: t("settings.title"), message: t("settings.message"), options,
-			descriptions: new Map([
-				[options[0], languageName()],
-				[options[1], state.showWorkflow || state.showTodos ? t("settings.on") : t("settings.off")],
-				[options[2], state.thinkingAutoCollapse ? t("settings.on") : t("settings.off")],
-				[options[3], state.touchMode ? t("settings.on") : t("settings.off")],
-				[options[4], state.markdown ? t("settings.on") : t("settings.off")],
-			]), onResolve: (result) => {
-				const index = options.indexOf(result?.value);
-				if (index === 0) openLanguageSelector();
-				if (index === 1) { const next = !(state.showWorkflow || state.showTodos); state.showWorkflow = next; state.showTodos = next; savePreferences(env?.PI_CODING_AGENT_DIR, { rightSidebarDefault: next }); }
-				if (index === 2) { state.thinkingAutoCollapse = !state.thinkingAutoCollapse; savePreferences(env?.PI_CODING_AGENT_DIR, { thinkingAutoCollapse: state.thinkingAutoCollapse }); }
-				if (index === 3) { state.touchMode = !state.touchMode; savePreferences(env?.PI_CODING_AGENT_DIR, { touchMode: state.touchMode }); }
-				if (index === 4) { state.markdown = !state.markdown; savePreferences(env?.PI_CODING_AGENT_DIR, { markdown: state.markdown }); }
-			},
+		clearTerminalSelection();
+		state.pointer.cancel();
+		const { rows, items } = buildSettingsRows();
+		replaceDialog({
+			source: "local",
+			kind: "settings",
+			title: t("settings.title"),
+			selected: 0,
+			scroll: 0,
+			settingsRows: rows,
+			items,
 		});
+		resetCursorBlink();
+		tui.requestRender();
 	};
 	const homeActionIds = ["new", "resume", "workspace", "provider", "settings", "quit"];
 	const runHomeAction = async (id) => {
@@ -2008,28 +2785,20 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		}
 
 		#bandRow(width, prompt, timestamp, owner) {
-			const bandWidth = Math.max(1, width - 2);
-			const prefix = this.#promptPrefix(Math.max(1, Math.floor(bandWidth * 0.45)));
-			const prefixWidth = visibleWidth(prefix);
-			const timeText = timestamp != null ? ` ${formatTime(timestamp, locale)}` : "";
-			const timeWidth = visibleWidth(timeText);
-			const promptWidth = Math.max(1, bandWidth - prefixWidth - 1 - timeWidth);
-			const rows = [];
-			const { rows: lines, sgr } = textRows(owner, "band", prompt, promptWidth);
-			for (let index = 0; index < lines.length; index++) {
-				let row = index > 0
-					? `${" ".repeat(prefixWidth + 1)}${sgr ? lines[index] : color.text(lines[index])}`
-					: `${prefix} ${sgr ? (lines[0] || " ") : color.text(lines[0] || " ")}`;
-				if (index === 0 && timeWidth > 0) {
-					row = pad(row, Math.max(2, bandWidth - timeWidth - 1)) + timeText;
-				}
-				rows.push(bandBackground(pad(row, bandWidth)));
-			}
-			const blank = bandBackground(" ".repeat(bandWidth));
-			const content = rows.length ? rows : [bandBackground(pad(`${prefix} `, bandWidth))];
-			// Grok Build gives every user turn a full row of breathing room above
-			// and below the prompt, even when the prompt itself occupies one row.
-			return [blank, ...content, blank];
+			return renderUserMessageBand({
+				width,
+				prompt,
+				timestamp,
+				owner,
+				locale,
+				visibleWidth,
+				pad,
+				promptPrefix: (maxWidth) => this.#promptPrefix(maxWidth),
+				textRows,
+				formatTime,
+				bandBackground,
+				color,
+			});
 		}
 
 		#taskRows() {
@@ -2111,12 +2880,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				}
 				const rows = [];
 				const start = tailLength;
-				for (const row of tool.rows(locale, tui.terminal.rows)) {
-					const painter = toolRowPaint(row);
-					const mark = row.kind === "header" ? "╭" : row.kind === "footer" ? "╰" : "│";
-					const text = truncateToWidth(toolRowContent(row, tool, name), Math.max(1, inner - 3), "…");
-					rows.push(`  ${color.border(mark)} ${painter(text)}`);
-				}
+				rows.push(...renderToolRows(tool, name, inner));
 				pushTailSegment(rows, (line) => line);
 				tailRanges.push({ id, start, end: tailLength });
 			};
@@ -2132,6 +2896,21 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			// Streaming text is wrapped incrementally: only the trailing partial line
 			// is reprocessed when a token arrives, instead of the whole response.
 			const phaseRows = (phase, phaseWidth) => {
+				if (state.markdown) {
+					const streamingCode = renderStreamingCodeBlock(phase.text || "", {
+						width: phaseWidth,
+						streamState: phase.highlightState ||= {},
+					});
+					if (streamingCode) return streamingCode;
+					if (/^\s*(`{3,}|~{3,})/m.test(phase.text || "")) {
+						const key = `${phaseWidth}\0${phase.text || ""}`;
+						if (phase.markdownKey !== key) {
+							phase.markdownKey = key;
+							phase.markdownRows = renderMarkdown(phase.text || "", { width: phaseWidth });
+						}
+						return phase.markdownRows;
+					}
+				}
 				if (!phase.inc) {
 					phase.inc = new IncrementalText(wrap);
 					phase.inc.append(phase.text || "");
@@ -2225,13 +3004,15 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 							state.liveTools.set(id, tool);
 						}
 						const start = lines.length;
-						for (const row of tool.rows(locale, tui.terminal.rows)) {
-							const painter = toolRowPaint(row);
-							const mark = row.kind === "header" ? "╭" : row.kind === "footer" ? "╰" : "│";
-							const text = truncateToWidth(toolRowContent(row, tool, part.name), Math.max(1, inner - 3), "…");
-							lines.push(`  ${color.border(mark)} ${painter(text)}`);
-						}
+						lines.push(...renderToolRows(tool, part.name, inner));
 						localToolRanges.push({ id, start, end: lines.length });
+					}
+				}
+				const turnError = assistantErrorMessage(message);
+				if (turnError) {
+					const label = t("status.turnFailed");
+					for (const [index, line] of wrapCached(message, "turnError", `${label}: ${turnError}`, Math.max(4, inner - 4)).entries()) {
+						lines.push(`  ${color.error(`${index === 0 ? "⚠ " : "  "}${line || " "}`)}`);
 					}
 				}
 				if (isLastAssistant && state.lastWorkMs != null && state.lastWorkMs > 0) {
@@ -2241,10 +3022,15 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			} else if (message.role === "custom" && message.display !== false) {
 				for (const line of wrapCached(message, "custom", `✦ ${textOfContent(message.content)}`, inner)) lines.push(`  ${color.warning(line)}`);
 			} else if (message.role === "bashExecution") {
-				for (const line of wrapCached(message, "bashCmd", `$ ${message.command || ""}`, inner)) lines.push(`  ${color.warning(line)}`);
-				if (message.output) {
-					for (const line of wrapCached(message, "bashOut", message.output, inner - 2).slice(0, 6)) lines.push(`  ${color.dim(line || " ")}`);
-				}
+				const output = message.output ? wrapCached(message, "bashOut", message.output, Math.max(4, inner - 6)) : [];
+				const visible = output.slice(-20).map((line) => color.muted(line || " "));
+				if (output.length > visible.length) visible.unshift(color.dim(`… ${output.length - visible.length} earlier lines`));
+				lines.push(...renderOutputBlock({
+					header: `$ ${message.command || ""}`,
+					state: Number(message.exitCode) ? "error" : "done",
+					sections: [{ lines: visible }],
+					width: Math.max(8, inner - 2),
+				}).map((line) => `  ${line}`));
 				lines.push("");
 			} else if (message.role === "compactionSummary") {
 				lines.push(color.success(`  ✓ ${t("status.checkpointSaved")}`), "");
@@ -2483,8 +3269,24 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					surface: "panel",
 				});
 			}
+			if (state.activeAgent) {
+				rows.push({ text: "", surface: "panel" });
+				rows.push({ text: `  ${bold(color.text("AGENT"))} ${color.accent(state.activeAgent.name)} ${color.dim(`· ${state.activeAgent.thinking}`)}`, surface: "panel" });
+			}
+			if (state.team) {
+				rows.push({ text: "", surface: "panel" });
+				rows.push({ text: `  ${bold(color.text("AGENT TEAM"))} ${color.dim(`${state.team.collaborationMode || "peer"} · ${state.team.phase || "stopped"} · /team`)}`, surface: "panel" });
+				for (const member of state.team.members || []) {
+					const status = member.status || "queued";
+					const icon = ["running", "queued"].includes(status) ? color.warning("◆")
+						: status === "done" ? color.success("✓")
+						: status === "cancelled" ? color.dim("−") : color.error("×");
+					const detail = status === "error" && member.error ? ` · ${member.error}` : "";
+					rows.push({ text: `  ${icon} ${color.text(member.name)} ${color.dim(`${member.role || "peer"} · ${status}${member.isolation ? ` · ${member.isolation}` : ""}${detail}`)}`, surface: "panel" });
+				}
+			}
 			for (const [key, status] of state.statuses) {
-				if (key === "tsukuyomi-mode" || key === "tsukuyomi-compact") continue;
+				if (["tsukuyomi-mode", "tsukuyomi-compact", "tsukuyomi-agent", "tsukuyomi-team"].includes(key)) continue;
 				rows.push({ text: `  ${color.dim(key)} ${color.muted(status)}`, surface: "panel" });
 			}
 			for (const widgetLines of state.widgets.values()) {
@@ -2502,7 +3304,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			lines.push(this.#panelRow(`${title}${" ".repeat(gap)}${color.dim(close)} `, width));
 			const count = formatNumber(state.workflow.length, locale);
 			const status = running ? color.warning(`${formatNumber(running, locale)} ${t("panel.running")}`) : color.muted(`${count} ${t("panel.events")}`);
-			lines.push(this.#panelRow(`  ${status} ${color.dim("· Ctrl+O")}`, width));
+			lines.push(this.#panelRow(`  ${status}${state.keybindingPreset === "legacy" ? ` ${color.dim("· Ctrl+O")}` : ""}`, width));
 			state.mouseZones.push({
 				key: "workflow:close",
 				x: originX + Math.max(0, width - 5),
@@ -2560,7 +3362,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const summary = state.todos.length
 				? t("status.tasksComplete", { done: formatNumber(done, locale), total: formatNumber(state.todos.length, locale) })
 				: t("panel.noTodos");
-			lines.push(this.#panelRow(`  ${color.muted(summary)} ${color.dim("· Ctrl+T")}`, width));
+			lines.push(this.#panelRow(`  ${color.muted(summary)}${state.keybindingPreset === "legacy" ? ` ${color.dim("· Ctrl+T")}` : ""}`, width));
 			state.mouseZones.push({
 				key: "todo:close",
 				x: originX + Math.max(0, width - 5),
@@ -2726,25 +3528,230 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			return next;
 		}
 
+		#drawSettings(screen, width, height, dialog) {
+			const next = Array.from({ length: height }, () => pad("", width));
+			const top = height >= 12 ? 2 : 0;
+			const bottom = height - 1;
+			const innerWidth = Math.max(1, width - 2);
+			const framed = (value = "") => `${color.border("│")}${pad(value, innerWidth)}${BLACK_BACKGROUND}${color.border("│")}`;
+			if (top > 0) next[0] = ` ${color.dim(compactPath(cwd))}`;
+			next[top] = color.border(`╭${"─".repeat(innerWidth)}╮`);
+			if (top + 1 < height) {
+				const title = `  ${bold(color.text(dialog.title || t("settings.title")))}`;
+				const close = color.dim("[×]");
+				const gap = " ".repeat(Math.max(1, innerWidth - visibleWidth(title) - visibleWidth(close) - 1));
+				next[top + 1] = framed(`${title}${gap}${close} `);
+			}
+			if (top + 2 < height) next[top + 2] = color.border(`├${"─".repeat(innerWidth)}┤`);
+			const footerY = Math.max(top + 3, bottom - 1);
+			const contentStart = top + 3;
+			const available = Math.max(0, footerY - contentStart);
+			const rows = dialog.settingsRows || [];
+			const selectedRow = Math.max(0, rows.findIndex((row) => row.type === "item" && row.item.index === dialog.selected));
+			const start = Math.max(0, Math.min(Math.max(0, rows.length - available), selectedRow - Math.floor(available / 2)));
+			dialog.mouseRows = [];
+			for (let offset = 0; offset < available && start + offset < rows.length; offset++) {
+				const entry = rows[start + offset];
+				const y = contentStart + offset;
+				if (entry.type === "header") {
+					const lead = `  ${bold(color.muted(entry.label))} `;
+					next[y] = framed(`${lead}${color.border("─".repeat(Math.max(0, innerWidth - visibleWidth(lead))))}`);
+					continue;
+				}
+				const item = entry.item;
+				const selected = item.index === dialog.selected;
+				const marker = item.toggle ? (item.detail === t("settings.on") ? color.success("[x]") : color.dim("[ ]")) : color.accent("›");
+				const right = item.detail ? String(item.detail) : "";
+				const left = `${selected ? color.accent("❯") : " "} ${marker} ${item.label}`;
+				const leftShown = truncateToWidth(left, Math.max(4, innerWidth - visibleWidth(right) - 3), "…");
+				const line = `${leftShown}${" ".repeat(Math.max(1, innerWidth - visibleWidth(leftShown) - visibleWidth(right) - 1))}${color.dim(right)}`;
+				next[y] = framed(selected ? listSelection(pad(line, innerWidth)) : pad(line, innerWidth));
+				dialog.mouseRows.push({ y, index: item.index });
+			}
+			for (let y = contentStart; y < footerY; y++) if (!next[y].includes("│")) next[y] = framed("");
+			if (footerY < height) next[footerY] = color.border(`├${"─".repeat(innerWidth)}┤`);
+			if (footerY + 1 < height) next[footerY + 1] = framed(` ${this.#shortcutHint(t("settings.footer"))}`);
+			if (bottom < height) next[bottom] = color.border(`╰${"─".repeat(innerWidth)}╯`);
+			dialog.mouseClose = { x: Math.max(0, width - 7), y: top + 1, width: 5, height: 1 };
+			dialog.mouseBox = { x: 0, y: top, width, height: bottom - top + 1 };
+			return next;
+		}
+
+		#drawHub(screen, width, height, dialog) {
+			const next = Array.from({ length: height }, () => menuBackground(" ".repeat(width)));
+			const wide = width >= 94;
+			const inspectorOnly = !wide && dialog.hubInspector;
+			const leftWidth = inspectorOnly ? 0 : wide ? Math.max(38, Math.floor(width * 0.47)) : width;
+			const detailWidth = inspectorOnly ? width : Math.max(1, width - leftWidth - 3);
+			const row = (content) => menuBackground(pad(content, width));
+			next[0] = row(` ${bold(color.title(dialog.title))}${" ".repeat(Math.max(1, width - visibleWidth(dialog.title) - 12))}${color.dim("[✗] Esc")}`);
+			next[1] = row(` ${color.muted(`${dialog.options.length}/${dialog.allOptions.length} · ↑↓ · Enter · Tab ${wide ? "detail" : inspectorOnly ? "roster" : "inspector"} · PgUp/PgDn · Esc`)}`);
+			next[2] = row(` ${color.accent("⌕")} ${color.text(dialog.query || (locale === "zh" ? "搜索成员、权限、任务…" : "Search members, permissions, jobs…"))}`);
+			const count = Math.max(1, height - 5);
+			const first = Math.max(0, Math.min(Math.max(0, dialog.options.length - count), dialog.selected - Math.floor(count / 2)));
+			dialog.mouseRows = [];
+			if (!inspectorOnly) {
+				for (let index = first; index < Math.min(dialog.options.length, first + count); index++) {
+					const y = 3 + index - first;
+					const selected = index === dialog.selected;
+					const label = truncateToWidth(dialog.options[index], Math.max(1, (leftWidth || width) - 4), "…");
+					next[y] = row(` ${selected ? color.accent("❯") : " "} ${selected ? bold(color.text(label)) : color.muted(label)}`);
+					dialog.mouseRows.push({ y, index });
+				}
+				if (!dialog.options.length) next[3] = row(` ${color.dim(t("dialog.noMatch"))}`);
+			}
+			const selectedOption = dialog.options[dialog.selected];
+			const item = dialog.hubRows?.[dialog.hubOptions?.indexOf(selectedOption)];
+			if (dialog.hubDetailKey !== item?.id) { dialog.hubDetailKey = item?.id; dialog.hubDetailOffset = 0; }
+			if (wide || inspectorOnly) {
+				const detail = item?.kind === "task" ? `${item.detail}\n${item.data?.output || item.data?.screen || ""}` : item?.kind === "report" ? `${item.detail}\n${item.data?.text || ""}` : item?.detail || "—";
+				const safeDetail = String(detail).replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "").slice(-6_000);
+				const detailLines = wrap(safeDetail, Math.max(1, detailWidth - 2));
+				const capacity = Math.max(1, height - 6);
+				dialog.hubDetailMax = Math.max(0, detailLines.length - capacity);
+				dialog.hubDetailOffset = Math.max(0, Math.min(dialog.hubDetailMax, dialog.hubDetailOffset || 0));
+				const shown = detailLines.slice(dialog.hubDetailOffset, dialog.hubDetailOffset + capacity);
+				const origin = inspectorOnly ? 0 : leftWidth;
+				for (let y = 3; y < height - 2; y++) {
+					const text = y === 3 ? bold(color.text(item?.title || "—")) : color.muted(shown[y - 4] || "");
+					const pane = menuBackground(`${inspectorOnly ? " " : "│"} ${pad(text, Math.max(1, detailWidth - 2))}`);
+					next[y] = inspectorOnly ? pane : compositeTuiLine(next[y], pane, origin, detailWidth, width);
+				}
+			}
+			next[height - 2] = !wide && !inspectorOnly
+				? row(` ${color.muted(truncateToWidth(item?.detail || "—", Math.max(1, width - 2), "…"))}`)
+				: row(` ${color.dim("─".repeat(Math.max(1, width - 2)))}`);
+			next[height - 1] = row(` ${color.dim(locale === "zh" ? "仅显示真实状态；操作会再次检查权限与任务状态" : "Live state only · actions recheck permissions and task status")}`);
+			dialog.mouseClose = { x: Math.max(0, width - 10), y: 0, width: 9, height: 1 };
+			dialog.mouseBox = { x: 0, y: 0, width, height };
+			return next;
+		}
+
+		#paintOverlayRow(width, content) {
+			return menuBackground(pad(content, width));
+		}
+
+		#drawPlanReview(width, height, dialog) {
+			const session = dialog.planSession;
+			const body = session ? session.sections.map((section) => [...section.lines, ...section.annotations.map((note) => `▎ note: ${note.note}`)].join("\n")).join("\n") : dialog.structured?.payload?.body || "";
+			const model = layoutPlanReview({
+				width, height, body,
+				options: session?.options || dialog.options,
+				selected: session?.selected || 0,
+				focus: session?.focus || "actions",
+				scroll: session?.scroll || 0,
+				tocCursor: session?.toc || 0,
+				slider: session?.slider || [],
+				sliderIndex: session?.sliderIndex || 0,
+				visibleWidth,
+			});
+			if (session) session.scroll = model.scroll;
+			dialog.planScroll = model.scroll;
+			dialog.planMaxScroll = model.maxScroll;
+			dialog.planSidebar = model.sidebar;
+			dialog.planTocMax = Math.max(0, model.headings.length - 1);
+			dialog.planSectionStarts = model.sectionStarts;
+			dialog.mouseRows = [];
+			dialog.mouseBox = { x: 0, y: 0, width, height: Math.min(height, model.regions.length) };
+			const next = Array.from({ length: height }, () => this.#paintOverlayRow(width, ""));
+			model.regions.forEach((region, y) => {
+				if (y >= height) return;
+				const rule = (glyph) => color.border(glyph.repeat(Math.max(1, width - 2)));
+				if (region.type === "top") next[y] = this.#paintOverlayRow(width, color.border(`╭─ ${bold(color.accent("Plan Review"))} ${"─".repeat(Math.max(0, width - 18))}╮`));
+				else if (region.type === "bottom") next[y] = this.#paintOverlayRow(width, color.border(`╰${rule("─")}╯`));
+				else if (region.type === "divider") next[y] = this.#paintOverlayRow(width, color.border(`├${rule("─")}┤`));
+				else if (region.type === "slider") next[y] = this.#paintOverlayRow(width, ` ${color.accent("◂")} ${bold(color.text(region.label || "—"))} ${color.dim(`${region.index + 1}/${region.count}`)} ${color.accent("▸")}`);
+			else if (region.type === "prompt") next[y] = this.#paintOverlayRow(width, ` ${bold(color.accent(region.text))}`);
+				else if (region.type === "help") next[y] = this.#paintOverlayRow(width, ` ${color.dim(region.text)}`);
+				else if (region.type === "option") {
+					const cursor = region.selected ? color.accent(region.focused ? "❯ " : "· ") : "  ";
+					const label = region.selected && region.focused ? bold(color.accent(region.label)) : color.text(region.label);
+					next[y] = this.#paintOverlayRow(width, ` ${cursor}${label}`);
+					dialog.mouseRows.push({ y, index: region.index, action: "plan-option" });
+				} else {
+					const body = color.muted(region.text || " ");
+					const side = region.sidebar ? color.dim(truncateToWidth(region.side || "", region.sidebarWidth, "…")) : "";
+					next[y] = this.#paintOverlayRow(width, region.sidebar ? ` ${pad(side, region.sidebarWidth)} ${color.border("│")} ${body}` : ` ${body}`);
+					dialog.mouseRows.push({ y, action: "plan-body" });
+				}
+			});
+			return next;
+		}
+
+		#drawAsk(screen, width, height, dialog) {
+			const payload = dialog.structured?.payload || {};
+			const session = dialog.askSession;
+			const current = session?.questions[session.tab];
+			const model = askPanelModel({
+				width, height,
+				questions: session ? [...session.questions.map((item) => ({ header: item.header || item.id, question: item.question })), { header: "Submit", question: "Review answers and submit." }] : payload.questions,
+				index: session ? session.tab : payload.index,
+				options: current ? [...current.options.map((option) => ({ ...option })), ...(current.allowOther ? [{ label: current.custom ? `Other: ${current.custom}` : "Other" }] : [])] : [{ label: "Submit", recommended: true }],
+				selected: current?.cursor || dialog.selected || 0,
+				answers: session ? session.questions.map((item) => item.selected.size || item.custom ? item : undefined) : payload.answers,
+			});
+			if (session && session.tab === session.questions.length) model.question = session.questions.map((item, index) => `${index + 1}. ${item.header || item.id}: ${item.custom || [...item.selected].join(", ") || "unanswered"}${item.note ? ` · note: ${item.note}` : ""}`).join("\n");
+			const next = [...screen];
+			for (let y = model.top; y < Math.min(height, model.top + model.boxHeight); y++) next[y] = blackBackground(" ".repeat(width));
+			const inner = Math.max(4, model.boxWidth - 4);
+			const tabs = model.tabs.map((tab) => `${tab.active ? color.accent(`[${tab.label}]`) : tab.done ? color.success(tab.label) : color.dim(tab.label)}`).join("  ");
+			const lines = [
+				color.border(`╭─ ${bold(color.accent(model.title))} ${"─".repeat(Math.max(0, model.boxWidth - 12))}╮`),
+				` ${tabs}`,
+				color.border(`├${"─".repeat(Math.max(1, model.boxWidth - 2))}┤`),
+				...wrap(model.question, inner).slice(0, 3).map((line) => ` ${bold(color.text(line))}`),
+				"",
+			];
+			dialog.mouseRows = [];
+			model.options.forEach((option, index) => {
+				const marker = option.recommended ? color.accent("★") : color.dim("○");
+				const cursor = option.selected ? color.accent("❯") : " ";
+				const label = option.selected ? bold(color.accent(option.label)) : color.text(option.label);
+				lines.push(` ${cursor} ${marker} ${label}`);
+				if (option.description && option.selected) lines.push(`     ${color.dim(option.description)}`);
+				dialog.mouseRows.push({ y: model.top + lines.length - 1, index });
+			});
+			lines.push(color.border(`├${"─".repeat(Math.max(1, model.boxWidth - 2))}┤`), ` ${color.dim(model.help)}`, color.border(`╰${"─".repeat(Math.max(1, model.boxWidth - 2))}╯`));
+			const box = lines.slice(0, model.boxHeight).map((line) => menuBackground(` ${pad(line, model.boxWidth - 2)} `));
+			while (box.length < model.boxHeight) box.push(menuBackground(" ".repeat(model.boxWidth)));
+			box.forEach((line, row) => { if (model.top + row < height) next[model.top + row] = compositeTuiLine(next[model.top + row], line, model.left, model.boxWidth, width); });
+			dialog.mouseBox = { x: model.left, y: model.top, width: model.boxWidth, height: model.boxHeight };
+			dialog.mouseClose = { x: model.left + model.boxWidth - 6, y: model.top, width: 4, height: 1 };
+			return next;
+		}
+
 		#drawDialog(screen, width, height) {
 			const dialog = state.dialog;
 			if (!dialog || width < 6 || height < 3) return screen;
+			if (dialog.kind === "plan-review") return this.#drawPlanReview(width, height, dialog);
+			if (dialog.kind === "ask") return this.#drawAsk(screen, width, height, dialog);
 			if (dialog.kind === "sessions") return this.#drawSessions(screen, width, height, dialog);
+			if (dialog.kind === "settings") return this.#drawSettings(screen, width, height, dialog);
+			if (dialog.kind === "hub" && width >= 50 && height >= 12) return this.#drawHub(screen, width, height, dialog);
 			if (dialog.closeHovered == null) dialog.closeHovered = false;
 			const preferredWidth = dialog.searchable ? 64 : 140;
 			const boxWidth = Math.max(1, Math.min(width, Math.max(60, Math.floor(width * 0.9)), Math.min(preferredWidth, Math.max(20, width - 4))));
 			const innerWidth = boxWidth - 4;
 			const content = [];
 			const optionRows = [];
-			if (dialog.message && dialog.kind !== "status" && !dialog.searchable) content.push(...wrap(dialog.message, innerWidth), "");
+			if (dialog.structured) {
+				const preview = structuredPreview(dialog.structured, innerWidth).flatMap((line) => wrap(line, innerWidth));
+				const capacity = Math.max(1, height - 12);
+				dialog.previewMaxOffset = Math.max(0, preview.length - capacity);
+				dialog.previewOffset = Math.max(0, Math.min(dialog.previewOffset || 0, dialog.previewMaxOffset));
+				if (dialog.previewOffset) content.push(color.dim("↑ PgUp"));
+				content.push(...preview.slice(dialog.previewOffset, dialog.previewOffset + capacity).map((line) => color.muted(line)));
+				if (dialog.previewOffset < dialog.previewMaxOffset) content.push(color.dim("↓ PgDown"));
+				content.push("");
+			} else if (dialog.message && dialog.kind !== "status" && !dialog.searchable) content.push(...wrap(dialog.message, innerWidth), "");
 			if (dialog.searchable) {
 				content.push(
 					"",
-					` ${bold(color.text(t("provider.searchLabel")))}${dialog.query ? ` ${color.text(dialog.query)}` : ""}`,
+					` ${bold(color.text(t("dialog.searchLabel")))}${dialog.query ? ` ${color.text(dialog.query)}` : ""}`,
 					"",
 				);
 			}
-			if (dialog.kind === "select" || dialog.kind === "confirm") {
+			if (dialog.kind === "select" || dialog.kind === "confirm" || dialog.kind === "hub") {
 				const visibleOptions = Math.max(3, Math.min(dialog.searchable ? 6 : 12, height - 8));
 				const first = Math.max(0, Math.min(
 					dialog.options.length - visibleOptions,
@@ -2774,6 +3781,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						content.push(`  ${color.dim(shown)}`);
 					}
 				}
+				if (!dialog.options.length) content.push(color.dim(`  ${t("dialog.noMatch")}`));
 				if (last < dialog.options.length) content.push(color.dim(`  ${t("dialog.moreDown", { count: dialog.options.length - last })}`));
 			} else if (dialog.kind === "multi") {
 				const visibleOptions = Math.max(3, Math.min(12, height - 8));
@@ -2786,8 +3794,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				for (let index = first; index < last; index++) {
 					const option = dialog.options[index];
 					const selected = index === dialog.selected;
-					const on = toolEnabled(option);
-					const marker = on ? bold(color.success("[x]")) : color.dim("[ ]");
+					const isApply = dialog.applyOption === option;
+					const on = !isApply && (dialog.checked ? dialog.checked(option) : toolEnabled(option));
+					const marker = isApply ? color.accent("[↵]") : on ? bold(color.success("[x]")) : color.dim("[ ]");
 					optionRows.push({ row: content.length, index });
 					content.push(`${selected ? color.accent("❯") : " "} ${marker} ${selected ? bold(color.text(option)) : color.muted(option)}`);
 					const description = dialog.descriptions?.get(option) || state.tools.labels[option] || t(TOOL_LABEL_KEYS[option] || option);
@@ -2865,7 +3874,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const lines = Array.from({ length: height }, () => "");
 			const compactHome = width < 80 || height < 22;
 			const composerWidth = width >= 12 ? width - 4 : Math.max(1, width);
-			const homeEditorWidth = Math.max(1, composerWidth - 6);
+			const homeEditorWidth = Math.max(1, composerWidth - 4);
 			const composer = this.#grokComposer(composerWidth, editorLinesFor(homeEditorWidth), compactHome ? 3 : 5);
 			const editorTop = Math.max(0, height - composer.lines.length - 2);
 			const editorLeft = Math.max(0, Math.floor((width - composerWidth) / 2));
@@ -2900,7 +3909,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const cardRoom = Math.max(0, editorTop - subtitleY - 1);
 			const cardHeight = Math.min(11, cardRoom);
 			if (cardHeight >= 3) {
-				const actionShortcuts = ["Enter", "Ctrl+S", "Ctrl+W", "", "", "Ctrl+Q"];
+				const actionShortcuts = ["Enter", "Ctrl+S", "Ctrl+W", "", "", ""];
 				const hintLines = cardHeight >= 9
 					? wrap(t("home.startHint"), Math.max(1, inner - 2)).slice(0, 2)
 					: [];
@@ -3065,16 +4074,47 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					text: `${leftShort}${" ".repeat(gap)}${color.dim(elapsed)}`,
 				});
 			}
+			// Queued prompts: Grok Build shows the text, not just a count. Show up
+			// to two wrapped rows per prompt and let the wheel scroll the rest.
+			if (state.queued > 0) {
+				const entries = [
+					...state.queueItems.steering.map((text) => ({ prefix: color.accent("↪"), text })),
+					...state.queueItems.followUp.map((text) => ({ prefix: color.success("+"), text })),
+				];
+				const contentWidth = Math.max(8, width - 6);
+				const lines = [];
+				for (const entry of entries) {
+					const wrapped = wrap(clean(entry.text), contentWidth);
+					const shown = wrapped.slice(0, 2);
+					for (let index = 0; index < shown.length; index++) {
+						const ellipsis = index === shown.length - 1 && wrapped.length > 2 ? color.dim(" …") : "";
+						lines.push(`    ${index === 0 ? entry.prefix : " "} ${color.dim(truncateToWidth(shown[index] || " ", contentWidth, "…"))}${ellipsis}`);
+					}
+				}
+				const viewport = Math.max(1, Math.min(4, lines.length));
+				state.queueMaxScroll = Math.max(0, lines.length - viewport);
+				state.queueScroll = Math.max(0, Math.min(state.queueMaxScroll, state.queueScroll || 0));
+				const start = state.queueScroll;
+				const end = Math.min(lines.length, start + viewport);
+				for (let index = start; index < end; index++) {
+					rows.push({ key: `dock:queue:${index}`, action: "dock-queue", text: truncateToWidth(lines[index], width, "…") });
+				}
+				if (end < lines.length) rows.push({ text: `    ${color.dim(`▾ ${formatNumber(lines.length - end, locale)} ${t("panel.more")}`)}` });
+			}
 			return rows;
 		}
 
 		#grokComposer(width, editorLines, maxRows) {
-			const columns = Math.max(1, width);
-			if (columns < 7 || maxRows < 3) {
+			const geometry = wideComposerGeometry(width, maxRows);
+			const { columns } = geometry;
+			const promptSurface = (value) => paintBackground(value, PROMPT_BACKGROUND);
+			if (geometry.minimal) {
 				const editorLine = editorLines.findLast((line) => visibleWidth(line) > 0) || "";
 				return {
-					lines: [pad(`${color.accent("❯")} ${editorLine}`, columns)],
+					lines: [promptSurface(pad(`${editorTheme.borderColor("╰─")} ${editorLine}`, columns))],
 					metaRow: 0,
+					statusX: 0,
+					statusWidth: 0,
 					providerX: 0,
 					providerWidth: 0,
 					modelX: 0,
@@ -3088,7 +4128,8 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				const plain = stripAnsi(value).trim();
 				return plain.length > 0 && /^[─↑↓ ]+$/.test(plain);
 			};
-			const contentBudget = Math.max(1, maxRows - 2);
+			const { chromeWidth, contentWidth } = geometry;
+			const contentBudget = Math.max(1, maxRows - 1);
 			const filteredEditor = editorLines.filter((line) => !isEditorRule(line));
 			// The cursor marker must survive into the final frame or the hardware
 			// cursor (and IME preedit) is misplaced. Tail-trimming can drop a marker
@@ -3097,48 +4138,65 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const content = markerIndex >= contentBudget
 				? filteredEditor.slice(Math.max(0, filteredEditor.length - contentBudget))
 				: limitRows(filteredEditor, contentBudget);
-			const captionRaw = clean(state.sessionName || "");
-			const caption = captionRaw ? truncateToWidth(` ${captionRaw} `, Math.max(0, columns - 6), "…") : "";
-			const captionWidth = visibleWidth(caption);
-			const topInside = caption
-				? `${"─".repeat(Math.max(2, columns - captionWidth - 4))}${color.muted(caption)}──`
-				: "─".repeat(Math.max(0, columns - 2));
-			const borderPainter = color.border;
-			const lines = [`${borderPainter("╭")}${borderPainter(topInside)}${borderPainter("╮")}`];
-			const bodyWidth = Math.max(1, columns - 6);
-			for (let index = 0; index < content.length; index++) {
-				const prefix = index === 0 ? color.accent("❯") : " ";
-				const rail = editorInputFocused() ? color.accent("▏") : borderPainter("│");
-				lines.push(`${rail} ${prefix} ${toolBackground(pad(content[index], bodyWidth))} ${borderPainter("│")}`);
-			}
-
+			const borderPainter = editorTheme.borderColor;
+			const borderAccent = editorTheme.borderColor;
+			const contextRaw = `${formatTokens(state.contextTokens ?? 0, locale)} · ${state.contextPercent == null ? "?" : `${formatPercent(state.contextPercent, locale)}%`}`;
 			const modelId = state.model?.id || state.model?.name || t("status.noModel");
 			const providerText = state.model?.provider || t("status.provider");
 			const modelText = modelId;
-			const modeText = `${t(`mode.${state.mode}`)}${state.thinking !== "off" ? ` · ${state.thinking}` : ""}`;
-			const contextRaw = state.contextPercent == null ? t("status.contextUnknown") : `${formatPercent(state.contextPercent, locale)}%`;
-			const metaRaw = ` ${contextRaw} · ${providerText}/${modelText} · ${modeText} `;
-			const insideBudget = Math.max(1, columns - 4);
-			const metaText = truncateToWidth(metaRaw, Math.max(1, Math.min(insideBudget - 1, Math.floor(insideBudget * 0.72))), "…");
-			const fillWidth = Math.max(1, insideBudget - visibleWidth(metaText));
-			const meta = state.contextPercent != null && state.contextPercent >= 85 ? color.error(metaText) : color.muted(metaText);
-			lines.push(`${borderPainter("╰─")}${borderPainter("─".repeat(fillWidth))}${meta}${borderPainter("─╯")}`);
-			const metaStart = 2 + fillWidth;
-			const providerOffset = Math.max(0, metaText.indexOf(providerText));
-			const modelOffset = Math.max(providerOffset, metaText.indexOf(modelText));
-			const modeOffset = Math.max(modelOffset, metaText.indexOf(modeText));
-			const providerWidth = Math.min(visibleWidth(providerText) + 1, Math.max(0, visibleWidth(metaText) - providerOffset));
-			const modelWidth = Math.min(visibleWidth(modelText) + 1, Math.max(0, visibleWidth(metaText) - modelOffset));
-			const modeWidth = Math.min(visibleWidth(modeText), Math.max(0, visibleWidth(metaText) - modeOffset));
+			const modelLabel = `${providerText}/${modelText}`;
+			const modeText = t(`mode.${state.mode}`);
+			const thinkingText = state.thinking !== "off" ? state.thinking : "";
+			const statusParts = [
+				{ raw: contextRaw, paint: (value) => color.dim(value) },
+				{ raw: modelLabel, paint: (value) => color.accent(value) },
+				{ raw: modeText, paint: (value) => bold(color.text(value)) },
+				...(thinkingText ? [{ raw: thinkingText, paint: (value) => color.muted(value) }] : []),
+			];
+			const rawStatus = statusParts.map((part) => part.raw).join(" · ");
+			const statusText = statusParts.map((part) => part.paint(part.raw)).join(color.dim(" · "));
+			const statusWidth = visibleWidth(statusText);
+			const statusAvailable = geometry.statusAvailable;
+			const fittedStatus = statusWidth > statusAvailable
+				? truncateToWidth(statusText, Math.max(1, statusAvailable), "…")
+				: statusText;
+			const fittedStatusWidth = visibleWidth(fittedStatus);
+			const statusLeftFill = Math.max(0, statusAvailable - fittedStatusWidth);
+			const lines = [promptSurface(
+				`${borderPainter("╭──")}${borderPainter("─".repeat(statusLeftFill))}${fittedStatus}${borderPainter("─".repeat(Math.max(0, statusAvailable - statusLeftFill - fittedStatusWidth)))}${borderPainter("──╮")}`,
+			)];
+			for (let index = 0; index < content.length; index++) {
+				// The editor's APC cursor marker is zero-width to the terminal but is
+				// not understood by pi-tui's generic truncator. Measure without it and
+				// append padding manually so IME/hardware-cursor placement survives.
+				const line = content[index];
+				const measuredWidth = visibleWidth(line.replace(CURSOR_MARKER, ""));
+				const fittedLine = `${line}${" ".repeat(Math.max(0, contentWidth - measuredWidth))}`;
+				if (index === content.length - 1) {
+					lines.push(promptSurface(`${borderAccent("╰─ ")}${fittedLine}${borderAccent(" ─╯")}`));
+				} else {
+					lines.push(promptSurface(`${borderPainter("│  ")}${fittedLine}${borderPainter("  │")}`));
+				}
+			}
+			const statusStart = chromeWidth + statusLeftFill;
+			const providerOffset = rawStatus.indexOf(providerText);
+			const modelOffset = rawStatus.indexOf(modelText, providerOffset + providerText.length);
+			const modeOffset = rawStatus.indexOf(modeText);
+			const contextOffset = rawStatus.indexOf(contextRaw);
+			const segmentWidth = (offset, raw) => offset >= 0 && offset < fittedStatusWidth ? Math.min(visibleWidth(raw), fittedStatusWidth - offset) : 0;
 			return {
 				lines: lines.slice(0, Math.max(1, maxRows)),
-				metaRow: lines.length - 1,
-				providerX: metaStart + providerOffset,
-				providerWidth,
-				modelX: metaStart + modelOffset,
-				modelWidth,
-				modeX: metaStart + modeOffset,
-				modeWidth,
+				metaRow: 0,
+				statusX: statusStart,
+				statusWidth: fittedStatusWidth,
+				providerX: statusStart + providerOffset,
+				providerWidth: segmentWidth(providerOffset, providerText),
+				modelX: statusStart + modelOffset,
+				modelWidth: segmentWidth(modelOffset, modelText),
+				modeX: statusStart + modeOffset,
+				modeWidth: segmentWidth(modeOffset, modeText),
+				contextX: statusStart + contextOffset,
+				contextWidth: segmentWidth(contextOffset, contextRaw),
 			};
 		}
 
@@ -3213,6 +4271,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				width: centerWidth,
 				height,
 				promptHeight: desiredPromptHeight,
+				statusHeight: 0,
 				dockHeight: firstDock.length,
 				// Progress belongs to the transcript in the Grok layout. Reserving a
 				// second fixed status row produced the old duplicated "responding" bar.
@@ -3280,7 +4339,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			}
 
 			const userTurnCount = state.userTurnCount ?? 0;
-			const timelineCandidate = userTurnCount >= 2 && layout.scrollback.width >= 60;
+			const timelineCandidate = state.keybindingPreset === "legacy" && userTurnCount >= 2 && layout.scrollback.width >= 60;
 			const railWidth = timelineCandidate ? 2 : 1;
 			const transcriptWidth = Math.max(1, layout.scrollback.width - railWidth);
 			const flow = this.#messageLines(transcriptWidth);
@@ -3482,6 +4541,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				action: "composer",
 			});
 			const metaY = layout.prompt.y + Math.min(layout.prompt.height - 1, composer.metaRow);
+			if (composer.contextWidth > 0) state.mouseZones.push({
+				key: "prompt:context",
+				x: shell.center.x + layout.prompt.x + composer.contextX,
+				y: metaY,
+				width: composer.contextWidth,
+				height: 1,
+				action: "status",
+			});
 			if (composer.providerWidth > 0) {
 				state.mouseZones.push({
 					key: "prompt:provider",
@@ -3549,9 +4616,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	tui.setFocus(editor);
 	const restoreSessionItem = (item) => {
 		if (!item) return;
-		if (item.path === state.sessionFile) { toast(t("toast.alreadySession"), "info"); state.dialog = undefined; return; }
+		if (item.path === state.sessionFile) { toast(t("toast.alreadySession"), "info"); clearDialog(); return; }
 		toast(t("toast.restoring", { name: item.name || t("session.empty") }), "info");
-		state.dialog = undefined;
+		clearDialog();
 		setTimeout(() => shutdown(0, { session: item.path, workspace: item.cwd }), 180);
 	};
 	const confirmTrashSession = (dialog) => {
@@ -3567,7 +4634,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				}
 				browser.selected = Math.max(0, Math.min(browser.selected, browser.items.length - 1));
 				clearTerminalSelection();
-				state.dialog = browser; tui.requestRender();
+				replaceDialog(browser); tui.requestRender();
 			},
 		});
 	};
@@ -3595,20 +4662,117 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			else if (!data.includes("\x1b") && !/[\u0000-\u001f\u007f]/.test(data)) { dialog.query += data; dialog.selected = 0; }
 			tui.requestRender(); return true;
 		}
+		if (dialog.kind === "plan-review" && dialog.planSession) {
+			const session = dialog.planSession;
+			const command = matchesKey(data, "escape") ? "cancel"
+				: matchesKey(data, "tab") ? "tab"
+				: matchesKey(data, "shift+tab") ? "shift-tab"
+				: matchesKey(data, "up") ? "up"
+				: matchesKey(data, "down") ? "down"
+				: matchesKey(data, "left") ? "left"
+				: matchesKey(data, "right") ? "right"
+				: matchesKey(data, "enter") ? (session.annotating ? "submit" : "enter")
+				: matchesKey(data, "pageUp") || data === "g" ? "top"
+				: matchesKey(data, "pageDown") || data === "G" ? "bottom"
+				: data === "d" ? "delete"
+				: data === "u" ? "undo"
+				: data === "a" ? "annotate"
+				: data === "c" ? "copy"
+				: data === "e" ? "editor"
+				: session.annotating && matchesKey(data, "backspace") ? "backspace"
+				: session.annotating && !data.includes("\x1b") && !/[\u0000-\u001f\u007f]/.test(data) ? "type"
+				: "";
+			if (command) {
+				const effect = planCommand(session, command, command === "submit" ? session.draft : data);
+				if (effect === "confirm") finishDialog({ value: planResult(session) });
+				else if (effect === "cancel") finishDialog({ cancelled: true });
+				else if (effect === "copy") { try { terminal.write(`\x1b]52;c;${Buffer.from(joinPlan(session)).toString("base64")}\x07`); } catch {} toast(locale === "zh" ? "方案已复制" : "Plan copied", "info"); }
+				else if (effect === "editor") {
+					const program = process.env.VISUAL || process.env.EDITOR;
+					if (!program) toast(locale === "zh" ? "未设置 EDITOR" : "EDITOR is not set", "warning");
+					else {
+						const file = join(tmpdir(), `tsukuyomi-plan-${Date.now()}.md`);
+						writeFileSync(file, joinPlan(session));
+						tui.stop();
+						const child = spawn(program, [file], { stdio: "inherit" });
+						child.on("exit", () => {
+							try {
+								const next = createPlanSession({ body: readFileSync(file, "utf8"), options: session.options, slider: session.slider });
+								next.sliderIndex = session.sliderIndex; next.focus = session.focus;
+								dialog.planSession = next;
+							} catch {}
+							tui.start();
+							tui.requestRender();
+						});
+					}
+				}
+			}
+			tui.requestRender(); return true;
+		}
+		if (dialog.kind === "ask" && dialog.askSession) {
+			const session = dialog.askSession;
+			const command = matchesKey(data, "escape") ? "cancel" : matchesKey(data, "tab") || matchesKey(data, "right") ? "tab" : matchesKey(data, "shift+tab") || matchesKey(data, "left") ? "shift-tab" : matchesKey(data, "up") ? "up" : matchesKey(data, "down") ? "down" : matchesKey(data, "enter") ? "enter" : data === " " ? "space" : data === "n" ? "note" : "";
+			if (!command) return true;
+			const effect = askCommand(session, command);
+			if (effect === "submit") finishDialog({ value: askResult(session) });
+			else if (effect === "cancel") finishDialog({ cancelled: true });
+			else if (effect === "prompt") openLocalInput({ title: session.prompt === "note" ? "Note" : "Other", onResolve: (result) => { if (result?.cancelled) askCommand(session, "cancel"); else askCommand(session, "submit", result?.value || ""); tui.requestRender(); } });
+			else tui.requestRender();
+			return true;
+		}
+		if (dialog.kind === "ask" && matchesKey(data, "enter")) {
+			if (!dialog.options.length) return true;
+			finishDialog({ value: dialog.options[dialog.selected] });
+			return true;
+		}
+		if (dialog.kind === "hub" && matchesKey(data, "tab")) {
+			dialog.hubInspector = !dialog.hubInspector;
+			dialog.hubDetailOffset = 0;
+			tui.requestRender();
+			return true;
+		}
+		if (dialog.kind === "hub" && matchesKey(data, "escape") && dialog.hubInspector && (tui.terminal.columns || 0) < 94) {
+			dialog.hubInspector = false;
+			tui.requestRender();
+			return true;
+		}
+		if (dialog.kind === "hub" && (matchesKey(data, "pageUp") || matchesKey(data, "pageDown"))) {
+			dialog.hubDetailOffset = Math.max(0, Math.min(dialog.hubDetailMax || 0, (dialog.hubDetailOffset || 0) + (matchesKey(data, "pageDown") ? 5 : -5)));
+			tui.requestRender();
+			return true;
+		}
+		if (dialog.kind === "settings") {
+			const count = dialog.items?.length || 0;
+			if (matchesKey(data, "escape")) { finishDialog({ cancelled: true }); return true; }
+			if (count === 0) return true;
+			if (matchesKey(data, "up") || matchesKey(data, "shift+tab")) dialog.selected = (dialog.selected - 1 + count) % count;
+			else if (matchesKey(data, "down") || matchesKey(data, "tab")) dialog.selected = (dialog.selected + 1) % count;
+			else if (matchesKey(data, "home")) dialog.selected = 0;
+			else if (matchesKey(data, "end")) dialog.selected = count - 1;
+			else {
+				const item = dialog.items[dialog.selected];
+				if (item && (matchesKey(data, "enter") || data === " " || matchesKey(data, "left") || matchesKey(data, "right"))) runSettingsAction(item.id);
+			}
+			tui.requestRender(); return true;
+		}
 		if (dialog.searchable && matchesKey(data, "escape") && dialog.query) {
-			dialog.query = ""; dialog.options = [...dialog.allOptions]; dialog.selected = 0; tui.requestRender(); return true;
+			dialog.query = ""; dialog.options = filterSelectOptions(dialog.allOptions, dialog.descriptions, dialog.query); dialog.selected = 0; tui.requestRender(); return true;
 		}
 		if (matchesKey(data, "escape")) {
 			finishDialog({ cancelled: true });
 			return true;
 		}
 		if (dialog.kind === "input" || dialog.kind === "editor") return false;
+		if (dialog.structured && (matchesKey(data, "pageUp") || matchesKey(data, "pageDown"))) {
+			dialog.previewOffset = Math.max(0, Math.min(dialog.previewMaxOffset || 0, (dialog.previewOffset || 0) + (matchesKey(data, "pageDown") ? 5 : -5)));
+			tui.requestRender(); return true;
+		}
 		if (dialog.searchable && matchesKey(data, "backspace")) {
 			dialog.query = [...dialog.query].slice(0, -1).join("");
-			const needle = dialog.query.toLocaleLowerCase(); dialog.options = dialog.allOptions.filter((option) => `${option} ${dialog.descriptions?.get(option) || ""}`.toLocaleLowerCase().includes(needle)); dialog.selected = 0; tui.requestRender(); return true;
+			dialog.options = filterSelectOptions(dialog.allOptions, dialog.descriptions, dialog.query); dialog.selected = 0; tui.requestRender(); return true;
 		}
 		if (dialog.searchable && !data.includes("\x1b") && !/[\u0000-\u001f\u007f]/.test(data)) {
-			dialog.query += data; const needle = dialog.query.toLocaleLowerCase(); dialog.options = dialog.allOptions.filter((option) => `${option} ${dialog.descriptions?.get(option) || ""}`.toLocaleLowerCase().includes(needle)); dialog.selected = 0; tui.requestRender(); return true;
+			dialog.query += data; dialog.options = filterSelectOptions(dialog.allOptions, dialog.descriptions, dialog.query); dialog.selected = 0; tui.requestRender(); return true;
 		}
 		if (dialog.kind === "status") {
 			if (matchesKey(data, "up") || matchesKey(data, "pageUp")) {
@@ -3622,19 +4786,22 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			return true;
 		}
 		if (matchesKey(data, "up") || matchesKey(data, "shift+tab")) {
+			if (!dialog.options.length) return true;
 			dialog.selected = (dialog.selected - 1 + dialog.options.length) % dialog.options.length;
 			tui.requestRender(); return true;
 		}
 		if (matchesKey(data, "down") || matchesKey(data, "tab")) {
+			if (!dialog.options.length) return true;
 			dialog.selected = (dialog.selected + 1) % dialog.options.length;
 			tui.requestRender(); return true;
 		}
 		if (dialog.kind === "multi") {
 			const option = dialog.options[dialog.selected];
-			if (matchesKey(data, "enter") || data === " ") toggleDialogTool(option);
+			if (matchesKey(data, "enter") || data === " ") toggleDialogOption(option);
 			return true;
 		}
 		if (matchesKey(data, "enter")) {
+			if (!dialog.options.length) return true;
 			const value = dialog.options[dialog.selected];
 			finishDialog(dialog.kind === "confirm" ? { confirmed: value === dialog.options[0] } : { value });
 			return true;
@@ -3645,12 +4812,39 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const handleDialogMouse = (mouse) => {
 		const dialog = state.dialog;
 		if (!dialog) return false;
+		if (dialog.kind === "ask" && dialog.askSession) {
+			if (mouse.wheel && !mouse.release) { askCommand(dialog.askSession, mouse.wheelDirection > 0 ? "tab" : "shift-tab"); tui.requestRender(); return true; }
+			if (mouse.motion || mouse.release || !mouse.left) return true;
+			const row = dialog.mouseRows?.find((entry) => entry.y === mouse.y);
+			if (row && dialog.askSession.questions[dialog.askSession.tab]) dialog.askSession.questions[dialog.askSession.tab].cursor = row.index;
+			const effect = askCommand(dialog.askSession, "enter");
+			if (effect === "submit") finishDialog({ value: askResult(dialog.askSession) });
+			else if (effect === "prompt") openLocalInput({ title: "Other", onResolve: (result) => { if (!result?.cancelled) askCommand(dialog.askSession, "submit", result?.value || ""); tui.requestRender(); } });
+			tui.requestRender(); return true;
+		}
+		if (dialog.kind === "plan-review") {
+			if (mouse.wheel && !mouse.release) { if (dialog.planSession) planCommand(dialog.planSession, "scroll", mouse.wheelDirection * 3); tui.requestRender(); return true; }
+			if (mouse.motion || mouse.release || !mouse.left) return true;
+			const row = dialog.mouseRows?.find((entry) => entry.y === mouse.y);
+			if (row?.action === "plan-option") { dialog.planFocus = "actions"; dialog.selected = row.index; finishDialog({ value: dialog.options[row.index] }); }
+			else if (row?.action === "plan-body") dialog.planFocus = "body";
+			tui.requestRender(); return true;
+		}
 		if (dialog.kind === "sessions") {
 			if (mouse.wheel && !mouse.release) { dialog.selected = Math.max(0, Math.min(Math.max(0, (dialog.visibleItems?.length || 1) - 1), dialog.selected + mouse.wheelDirection * 3)); tui.requestRender(); return true; }
 			if (mouse.motion || mouse.release || !mouse.left) return true;
 			if (dialog.mouseClose && mouse.x >= dialog.mouseClose.x && mouse.x < dialog.mouseClose.x + dialog.mouseClose.width && mouse.y === 0) { finishDialog({ cancelled: true }); return true; }
 			const row = dialog.mouseRows?.find((entry) => entry.y === mouse.y);
 			if (row) { dialog.selected = row.index; restoreSessionItem(dialog.visibleItems?.[row.index]); }
+			return true;
+		}
+		if (dialog.kind === "settings") {
+			const count = dialog.items?.length || 0;
+			if (mouse.wheel && !mouse.release) { dialog.selected = Math.max(0, Math.min(Math.max(0, count - 1), dialog.selected + mouse.wheelDirection * 2)); tui.requestRender(); return true; }
+			if (mouse.motion || mouse.release || !mouse.left) return true;
+			if (dialog.mouseClose && mouse.x >= dialog.mouseClose.x && mouse.x < dialog.mouseClose.x + dialog.mouseClose.width && mouse.y === dialog.mouseClose.y) { finishDialog({ cancelled: true }); return true; }
+			const row = dialog.mouseRows?.find((entry) => entry.y === mouse.y);
+			if (row) { const item = dialog.items?.[row.index]; dialog.selected = row.index; if (item) runSettingsAction(item.id); }
 			return true;
 		}
 		if (mouse.wheel && !mouse.release) {
@@ -3661,7 +4855,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				tui.requestRender();
 				return true;
 			}
-			dialog.selected = Math.max(0, Math.min(dialog.options.length - 1, dialog.selected + mouse.wheelDirection));
+			dialog.selected = Math.max(0, Math.min(Math.max(0, dialog.options.length - 1), dialog.selected + mouse.wheelDirection));
 			tui.requestRender();
 			return true;
 		}
@@ -3688,7 +4882,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (row && dialog.mouseBox && mouse.x >= dialog.mouseBox.x && mouse.x < dialog.mouseBox.x + dialog.mouseBox.width) {
 			dialog.selected = row.index;
 			const value = dialog.options[row.index];
-			if (dialog.kind === "multi") toggleDialogTool(value);
+			if (dialog.kind === "multi") toggleDialogOption(value);
 			else finishDialog(dialog.kind === "confirm" ? { confirmed: value === dialog.options[0] } : { value });
 		}
 		return true;
@@ -3757,6 +4951,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			return true;
 		}
 		if (mouse.wheel && !mouse.release) {
+			const queueZone = state.mouseZones.find((zone) => zone.action === "dock-queue" &&
+				mouse.x >= zone.x && mouse.x < zone.x + zone.width && mouse.y >= zone.y && mouse.y < zone.y + zone.height);
+			if (queueZone) {
+				state.queueScroll = Math.max(0, Math.min(state.queueMaxScroll || 0, (state.queueScroll || 0) + mouse.wheelDirection * 2));
+				tui.requestRender();
+				return true;
+			}
 			const panel = panelAtPoint(mouse);
 			if (panel) {
 				const key = panelScrollKey(panel);
@@ -3864,6 +5065,15 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				state.workflowFollowTail = false;
 				break;
 			case "dock-toggle": state.dockTasksExpanded = !state.dockTasksExpanded; break;
+			case "dock-queue": {
+				openLocalSelect({
+					title: locale === "zh" ? "清空等待队列" : "Clear queued messages",
+					message: locale === "zh" ? "Pi 仅支持清空整个队列，不能只移除一条。确定清空所有后续与纠正消息？" : "Pi can only clear the entire queue, not one entry. Remove all steering and follow-up messages?",
+					kind: "confirm", options: [t("action.yes"), t("action.no")], selected: 1,
+					onResolve: (result) => result?.confirmed && rpc.request({ type: "clear_queue" }, 10_000).catch((error) => toast(error?.message || String(error), "error")),
+				});
+				break;
+			}
 			case "timeline-turn": setTranscriptOffset(zone.offset); break;
 			case "panel-body": break;
 			case "composer": tui.setFocus(editor); break;
@@ -3903,6 +5113,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const inputListener = (data) => {
 		// Application listeners run before pi's focused-component release guard.
 		if (isKeyRelease(data)) return { consume: true };
+		if (state.updating) return { consume: true };
 		if (state.terminalJob && !parseSgrMouse(data) && data !== FOCUS_IN && data !== FOCUS_OUT) {
 			if (matchesKey(data, "ctrl+]")) { state.terminalJob = undefined; tui.requestRender(); return { consume: true }; }
 			let input = decodeKittyPrintable(data) ?? data;
@@ -3910,9 +5121,17 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			void taskClient.request("input", { id: state.terminalJob, data: input }).catch((error) => { state.terminalJob = undefined; toast(error.message, "error"); });
 			return { consume: true };
 		}
-		if (!state.dialog && matchesKey(data, "alt+enter")) {
+		if (!state.dialog && keyMatches(data, "message.followUp")) {
 			const value = editor.getText();
 			if (value.trim()) { editor.setText(""); void runInput(value, "followUp"); }
+			return { consume: true };
+		}
+		// Forced interject while a run is active (requires a terminal that can
+		// distinguish ctrl+enter, e.g. Kitty/Ghostty/WezTerm). `/interrupt <text>`
+		// is the portable equivalent.
+		if (!state.dialog && keyMatches(data, "message.interrupt")) {
+			const value = editor.getText();
+			if (value.trim()) void interruptAndSend(value);
 			return { consume: true };
 		}
 		if (data === FOCUS_OUT || data === FOCUS_IN) {
@@ -3944,16 +5163,43 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (matchesKey(data, "enter") && !state.active && !editor.getText()) {
 			void runHomeAction(homeActionIds[state.homeSelected]).catch((error) => toast(error?.message || String(error), "error")); return { consume: true };
 		}
-		if (matchesKey(data, "ctrl+p")) { openPalette(); return { consume: true }; }
-		if (matchesKey(data, "ctrl+s") && state.active) { openSessionsDialog(); return { consume: true }; }
-		if (matchesKey(data, "shift+tab")) { void nextMode(); return { consume: true }; }
-		if (matchesKey(data, "ctrl+b")) {
+		if (keyMatches(data, "palette.open")) { openPalette(); return { consume: true }; }
+		if (keyMatches(data, "model.cycleForward")) { void cycleModel(1).catch(() => {}); return { consume: true }; }
+		if (keyMatches(data, "model.cycleBackward")) { void cycleModel(-1).catch(() => {}); return { consume: true }; }
+		if (keyMatches(data, "model.select")) { void openModelSelector().catch(() => {}); return { consume: true }; }
+		if (keyMatches(data, "hub.open")) { openTeam(); return { consume: true }; }
+		if (keyMatches(data, "sessions.open") && state.active) { void openSessionsDialog(); return { consume: true }; }
+		if (keyMatches(data, "mode.toggle")) { void nextMode(); return { consume: true }; }
+		if (keyMatches(data, "thinking.cycle")) { void cycleThinkingLevel().catch(() => {}); return { consume: true }; }
+		if (keyMatches(data, "files.toggle")) {
 			if (!state.workspaceDeclared) askShowFiles();
 			else { activate(); togglePanel("files"); tui.requestRender(); }
 			return { consume: true };
 		}
-		if (matchesKey(data, "ctrl+o")) { activate(); togglePanel("workflow"); tui.requestRender(); return { consume: true }; }
-		if (matchesKey(data, "ctrl+t")) { activate(); togglePanel("todo"); tui.requestRender(); return { consume: true }; }
+		if (keyMatches(data, "workflow.toggle")) { activate(); togglePanel("workflow"); tui.requestRender(); return { consume: true }; }
+		if (keyMatches(data, "todo.toggle")) { activate(); togglePanel("todo"); tui.requestRender(); return { consume: true }; }
+		if (keyMatches(data, "thinking.toggle") && state.active) {
+			const index = state.messages.findLastIndex((message) => message?.role === "assistant" && message.content?.some?.((part) => part.type === "thinking"));
+			if (index >= 0) {
+				if (state.thinkingExpanded.has(index)) state.thinkingExpanded.delete(index); else state.thinkingExpanded.add(index);
+				tui.requestRender();
+			}
+			return { consume: true };
+		}
+		if (keyMatches(data, "tools.expand") && state.active) {
+			const index = state.messages.findLastIndex((message) => message?.role === "assistant" && message.content?.some?.((part) => part.type === "toolCall"));
+			if (index >= 0) {
+				for (const part of state.messages[index]?.content || []) if (part?.type === "toolCall") {
+					const id = part.id || part.toolCallId;
+					if (!id) continue;
+					if (state.inlineDiffExpanded.has(id)) state.inlineDiffExpanded.delete(id); else state.inlineDiffExpanded.add(id);
+					const tool = state.liveTools.get(id);
+					if (tool) { tool.expanded = !tool.expanded; state.dirtyToolIds.add(id); }
+				}
+				tui.requestRender();
+			}
+			return { consume: true };
+		}
 		if (matchesKey(data, "pageUp")) {
 			setTranscriptOffset(state.transcriptOffset + Math.max(4, tui.terminal.rows - 10));
 			tui.requestRender(); return { consume: true };
@@ -3971,7 +5217,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			void rpc.request({ type: "clear_queue" }, 10_000).finally(() => rpc.request({ type: "abort" }, 30_000).catch(() => {}));
 			return { consume: true };
 		}
-		if (matchesKey(data, "ctrl+e") && state.active) {
+		if (keyMatches(data, "thinking.expand") && state.active) {
 			const index = state.messages.findLastIndex((message) => message?.role === "assistant");
 			if (index >= 0) {
 				if (state.thinkingExpanded.has(index)) state.thinkingExpanded.delete(index); else state.thinkingExpanded.add(index);
@@ -4081,8 +5327,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 
 		const updateWorkflow = (event, status, immediate = false) => {
 		let liveChanged = false;
+		let tool;
 		if (event.toolCallId && event.toolName !== "todo") {
-			let tool = state.liveTools.get(event.toolCallId);
+			tool = state.liveTools.get(event.toolCallId);
 			if (!tool) { tool = new LiveTool(event.toolCallId); state.liveTools.set(event.toolCallId, tool); }
 			liveChanged = tool.update(event);
 			if (liveChanged) state.dirtyToolIds.add(event.toolCallId);
@@ -4096,7 +5343,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		}
 		let item = state.workflow.find((entry) => entry.id === event.toolCallId);
 		let changed = false;
-		const nextOutput = clean(redactText(toolResultText(result)));
+		// The live tool already sanitized this exact result; reuse it instead of
+		// redacting and scanning a potentially megabyte-sized output twice.
+		const nextOutput = result !== undefined && tool ? tool.output : clean(redactText(toolResultText(result)));
 		if (!item) {
 			const args = event.args || {};
 			item = {
@@ -4152,7 +5401,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			item.visualCache = undefined;
 		}
 		if (changed || liveChanged) requestWorkflowRender(immediate);
-		if (status !== "running" && ["edit", "write", "bash"].includes(event.toolName)) tree.refresh();
+		if (status !== "running" && ["edit", "write", "bash"].includes(event.toolName)) refreshTree();
 	};
 
 	const handleExtensionUi = (event) => {
@@ -4171,6 +5420,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			tui.requestRender(); return;
 		}
 		if (event.method === "setWidget") {
+			if (event.widgetKey === STRUCTURED_WIDGET) {
+				const metadata = readStructuredWidget(event.widgetLines);
+				if (metadata) {
+					pendingStructured.clear();
+					pendingStructured.set(metadata.nonce, metadata);
+				} else pendingStructured.clear();
+				return;
+			}
 			if (event.widgetKey === "tsukuyomi-providers-payload" && Array.isArray(event.widgetLines)) {
 				try {
 					const payload = JSON.parse(event.widgetLines.join("\n"));
@@ -4179,6 +5436,18 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						return;
 					}
 				} catch {}
+			}
+			if (event.widgetKey === "tsukuyomi-agent-payload") {
+				try { state.activeAgent = event.widgetLines ? JSON.parse(event.widgetLines.join("\n")) : undefined; } catch { state.activeAgent = undefined; }
+				tui.requestRender();
+				return;
+			}
+			if (event.widgetKey === "tsukuyomi-agents-payload") return;
+			if (event.widgetKey === "tsukuyomi-team-payload") {
+				try { state.team = event.widgetLines ? JSON.parse(event.widgetLines.join("\n")) : undefined; } catch { state.team = undefined; }
+				refreshHubDialog();
+				tui.requestRender();
+				return;
 			}
 			if (event.widgetKey === "tsukuyomi-tools-payload" && Array.isArray(event.widgetLines)) {
 				try {
@@ -4203,22 +5472,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (event.method === "setTitle") { terminal.setTitle(event.title || "Tsukuyomi"); return; }
 		if (event.method === "set_editor_text") { editor.setText(event.text || ""); resetCursorBlink(); return; }
 		if (!["select", "confirm", "input", "editor"].includes(event.method)) return;
-		const kind = event.method;
-		const options = kind === "confirm" ? [t("action.yes"), t("action.no")] : (event.options || []);
-		clearTerminalSelection();
-		state.dialog = {
-			source: "pi",
-			id: event.id,
-			kind,
-			title: event.title || t("dialog.plugin"),
-			message: event.message || (kind === "input" ? event.placeholder : undefined),
-			options,
-			selected: 0,
-			savedText: editor.getText(),
-		};
-		if (kind === "input") editor.setText("");
-		if (kind === "editor") editor.setText(event.prefill || "");
-		tui.requestRender();
+		extensionDialogs.enqueue(event);
 	};
 
 	const handleRpcEvent = (event) => {
@@ -4228,7 +5482,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				if (!state.runWorkSince) state.runWorkSince = Date.now();
 				activate();
 				break;
-			case "agent_settled":
+			case "agent_settled": {
+				// Safety net for a failed turn whose `message_end` was not observed
+				// (reconnect, extension replacement): re-check the run's last assistant
+				// message. notifyTurnError dedupes, so a healthy turn stays silent.
+				const settledAssistant = [...state.messages].reverse().find((message) => message?.role === "assistant");
+				if (settledAssistant && (state.runStartAt == null || settledAssistant.timestamp == null || settledAssistant.timestamp >= state.runStartAt)) {
+					notifyTurnError(settledAssistant);
+				}
 				if (state.runWorkSince) {
 					if (state.thinkingPhaseStart != null) {
 						state.runThoughtMs += Date.now() - state.thinkingPhaseStart;
@@ -4240,27 +5501,29 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					state.runThoughtMs = 0;
 				}
 				state.working = false;
-				void refreshMessages({ settleStream: true, forceSettle: true }).finally(() => {
-					if (!state.working) {
-						clearStream();
-						tui.requestRender();
-					}
-				});
-				void refreshStats(); tree.refresh(); break;
+				settledTurns += 1;
+				state.runStartIndex ??= resolveRunStartIndex();
+				clearStream();
+				tui.requestRender();
+				if (messageLogNeedsReconcile || settledTurns % RECONCILE_EVERY_TURNS === 0) {
+					void refreshMessages({ settleStream: true, forceSettle: true });
+				}
+				void refreshStats(); refreshTree(); break;
+			}
 			case "message_start":
 				if (event.message?.role === "assistant") {
 					clearStream();
-					state.streamAssistantBaseline = state.messages.filter((message) => message?.role === "assistant").length;
+					state.streamAssistantBaseline = state.assistantCount || 0;
 					state.streamStartedAt = Date.now();
 				}
 				break;
 			case "message_update": {
 				const delta = event.assistantMessageEvent;
-				if (delta?.type === "toolcall_delta" || delta?.type === "toolcall_start") {
-					const part = delta.partial?.content?.[delta.contentIndex];
-					if (part?.id && part.name) {
-						updateWorkflow({ type: "tool_preview", toolCallId: part.id, toolName: part.name, args: part.arguments || {} }, "running");
-						if (!state.stream.some((phase) => phase.id === part.id)) pushToolPhase({ toolCallId: part.id, toolName: part.name, args: part.arguments || {} });
+				if (delta?.type?.startsWith("toolcall_")) {
+					const part = toolCallStream.accept(delta);
+					if (part) {
+						updateWorkflow({ type: "tool_preview", toolCallId: part.id, toolName: part.name, args: part.args }, "running");
+						if (!state.stream.some((phase) => phase.id === part.id)) pushToolPhase({ toolCallId: part.id, toolName: part.name, args: part.args });
 					}
 				}
 				if (delta?.type === "text_delta") {
@@ -4276,14 +5539,27 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				requestDraw(false);
 				return;
 			}
-			case "message_end":
-				void refreshMessages({ settleStream: true }); break;
+			case "message_end": {
+				notifyTurnError(event.message);
+				// Mirror the kernel's own append instead of asking it for the whole
+				// transcript. This keeps long sessions responsive: a turn with many
+				// tool calls no longer round-trips a full snapshot per message.
+				appendFinalMessage(event.message);
+				if (event.message?.role === "assistant") {
+					state.streamStartedAt = undefined;
+					clearStream();
+				}
+				requestDraw(false);
+				break;
+			}
 			case "tool_execution_start": updateWorkflow(event, "running", true); pushToolPhase(event); break;
 			case "tool_execution_update": updateWorkflow(event, "running"); return;
 			case "tool_execution_end": updateWorkflow(event, event.isError ? "error" : "done", true); markToolPhase(event.toolCallId, event.isError); break;
 			case "queue_update":
-				state.queued = (event.steering?.length || 0) + (event.followUp?.length || 0);
+				state.queueItems = { steering: [...(event.steering || [])], followUp: [...(event.followUp || [])] };
+				state.queued = state.queueItems.steering.length + state.queueItems.followUp.length;
 				state.widgets.set("queue", [...(event.steering || []).map((s) => `↪ ${locale === "zh" ? "纠正" : "Steer"}: ${s}`), ...(event.followUp || []).map((s) => `+ ${locale === "zh" ? "后续" : "Follow-up"}: ${s}`)]);
+				if (state.queueScroll > state.queueMaxScroll) state.queueScroll = state.queueMaxScroll;
 				break;
 			case "thinking_level_changed": if (event.level) state.thinking = event.level; break;
 			case "compaction_start": state.compacting = true; state.compactStatus = `${event.reason} · ${t("status.compactingShort")}`; break;
@@ -4300,7 +5576,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	};
 	rpc.onEvent(handleRpcEvent);
 	const handleJob = (job) => {
-		if (job.cwd !== cwd || !job.toolCallId) return;
+		if (job.cwd !== cwd) return;
+		refreshHubDialog(job);
+		if (!job.toolCallId) return;
 		const toolName = job.kind === "pty" ? "pty" : "subagent";
 		const result = { content: [{ type: "text", text: job.kind === "pty" && !job.endedAt ? job.screen || job.output : job.output }], details: { ...job, jobId: job.id } };
 		updateWorkflow({ type: job.endedAt ? "tool_execution_end" : "tool_execution_update", toolName, toolCallId: job.toolCallId, args: { command: job.command }, result, isError: job.status === "error" || job.status === "cancelled" }, job.endedAt ? job.status : "running", Boolean(job.endedAt));
@@ -4373,6 +5651,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			try { for (const job of await taskClient.request("subscribe")) handleJob(job); } catch (error) { toast(error.message, "error"); }
 		}
 		tui.requestRender(true);
+		setTimeout(() => { void promptForUpdate({ automatic: true }); }, 250);
 		if (workspaceExplicit && !workspaceEntry?.state) {
 			const askWhenReady = () => {
 				if (state.stopped) return;

@@ -1,6 +1,93 @@
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 
+/**
+ * Incremental newline-delimited JSON buffer.
+ *
+ * The RPC stream is one JSON object per line, but a single response (for example
+ * `get_messages` on a long session) can be tens of megabytes. Accumulating the
+ * response as a JS string and re-scanning it on every chunk is O(n^2): V8
+ * flattens the growing rope on each `indexOf`, and each slice copies the tail.
+ * This buffer keeps the incoming chunks in a queue, scans each chunk once with
+ * the native Buffer search, and concatenates a line only when it is complete.
+ */
+export class LineBuffer {
+	constructor() {
+		this.chunks = [];
+		this.scanIndex = 0;
+		this.scanOffset = 0;
+		this.lineIndex = 0;
+		this.lineOffset = 0;
+	}
+
+	push(chunk) {
+		if (chunk == null) return;
+		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+		if (buffer.length) this.chunks.push(buffer);
+	}
+
+	/**
+	 * Take up to `maxLines` complete lines (or until `maxMs` elapses), preserving
+	 * the trailing partial line for the next call. Returns whether complete lines
+	 * may still be buffered so the caller can yield to the event loop.
+	 */
+	drain({ maxLines = 64, maxMs = 4 } = {}) {
+		const startedAt = Date.now();
+		const lines = [];
+		let stoppedForBudget = false;
+		for (;;) {
+			if (lines.length >= maxLines || Date.now() - startedAt >= maxMs) {
+				stoppedForBudget = true;
+				break;
+			}
+			if (this.scanIndex >= this.chunks.length) break;
+			const chunk = this.chunks[this.scanIndex];
+			const newline = chunk.indexOf(0x0a, this.scanOffset);
+			if (newline < 0) {
+				this.scanOffset = 0;
+				this.scanIndex += 1;
+				continue;
+			}
+			lines.push(this.#line(newline).toString("utf8"));
+			this.scanOffset = newline + 1;
+			if (this.scanOffset >= chunk.length) {
+				this.scanIndex += 1;
+				this.scanOffset = 0;
+			}
+			this.lineIndex = this.scanIndex;
+			this.lineOffset = this.scanOffset;
+		}
+		this.#compact();
+		const more = stoppedForBudget && this.scanIndex < this.chunks.length;
+		return { lines, more };
+	}
+
+	/** Concatenate the current line's chunks and the prefix ending at `endOffset`. */
+	#line(endOffset) {
+		const first = this.chunks[this.lineIndex];
+		if (this.lineIndex === this.scanIndex) return first.subarray(this.lineOffset, endOffset);
+		const parts = [];
+		for (let index = this.lineIndex; index < this.scanIndex; index++) parts.push(this.chunks[index]);
+		parts.push(this.chunks[this.scanIndex].subarray(this.lineOffset, endOffset));
+		return Buffer.concat(parts);
+	}
+
+	#compact() {
+		if (this.lineIndex > 0) {
+			this.chunks.splice(0, this.lineIndex);
+			this.scanIndex -= this.lineIndex;
+			this.lineIndex = 0;
+		}
+		// Drop the consumed prefix of the current line's first chunk. The scan
+		// cursor only moves with it when it points into that same chunk.
+		if (this.lineOffset > 0 && this.chunks.length) {
+			this.chunks[0] = this.chunks[0].subarray(this.lineOffset);
+			if (this.scanIndex === 0) this.scanOffset -= this.lineOffset;
+			this.lineOffset = 0;
+		}
+	}
+}
+
 export class PiRpc {
 	constructor(piBin, args, env, cwd = process.cwd()) {
 		this.piBin = piBin;
@@ -8,7 +95,7 @@ export class PiRpc {
 		this.env = env;
 		this.cwd = cwd;
 		this.child = undefined;
-		this.stdoutBuffer = "";
+		this.lineBuffer = new LineBuffer();
 		this.stdoutDrainScheduled = undefined;
 		this.stderrBuffer = "";
 		this.sequence = 0;
@@ -36,7 +123,12 @@ export class PiRpc {
 
 	start() {
 		if (this.child) return;
-		const socat = process.env.TSUKUYOMI_SOCAT || process.env.KAGUYAPI_SOCAT || "/usr/bin/socat";
+		// Only use socat when explicitly configured. Its EXEC address parser cannot
+		// reliably pass JavaScript paths containing non-ASCII characters (for
+		// example this project's `/文档/` path), which makes every worker exit
+		// before PI starts. Node's pipes are sufficient for the RPC stream and are
+		// the portable default; set TSUKUYOMI_SOCAT to opt into a PTY when needed.
+		const socat = process.env.TSUKUYOMI_SOCAT || process.env.KAGUYAPI_SOCAT;
 		// npm exposes pi through a shell shim. Running the resolved JavaScript
 		// entry with this Node executable also works in packaged environments
 		// whose PATH intentionally omits node.
@@ -65,7 +157,8 @@ export class PiRpc {
 				cwd: this.cwd,
 			});
 		}
-		this.child.stdout.setEncoding("utf8");
+		// stdout stays as Buffers so LineBuffer can scan each chunk natively and
+		// only decode a line once it is complete (multi-byte safe across chunks).
 		this.child.stderr.setEncoding("utf8");
 		// A kernel can exit between request scheduling and stdin.write(). Keep the
 		// resulting broken pipe inside the RPC lifecycle instead of crashing Node.
@@ -81,48 +174,41 @@ export class PiRpc {
 	}
 
 	#consumeStdout(chunk) {
-		this.stdoutBuffer += chunk;
+		this.lineBuffer.push(chunk);
 		if (this.stdoutDrainScheduled) return;
-		const startedAt = Date.now();
-		let drained = 0;
-		for (;;) {
-			// Match Grok Build's bounded stream drain: a large RPC read must not
-			// monopolize the JS turn while keyboard data is waiting in the terminal
-			// pipe. Preserve ordering, but yield after one small batch/time slice.
-			if (drained >= 32 || Date.now() - startedAt >= 4) {
-				if (this.stdoutBuffer.includes("\n")) {
-					this.stdoutDrainScheduled = setImmediate(() => {
-						this.stdoutDrainScheduled = undefined;
-						this.#consumeStdout("");
-					});
-					this.stdoutDrainScheduled.unref?.();
-				}
-				break;
-			}
-			const newline = this.stdoutBuffer.indexOf("\n");
-			if (newline < 0) break;
-			let line = this.stdoutBuffer.slice(0, newline);
-			this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-			drained += 1;
-			if (line.endsWith("\r")) line = line.slice(0, -1);
-			if (!line) continue;
-			let value;
-			try {
-				value = JSON.parse(line);
-			} catch {
-				this.#emitStderr(`Non-JSON output from PI: ${line}`);
-				continue;
-			}
-			if (value.type === "response" && value.id && this.pending.has(value.id)) {
-				const pending = this.pending.get(value.id);
-				this.pending.delete(value.id);
-				clearTimeout(pending.timer);
-				if (value.success) pending.resolve(value.data);
-				else pending.reject(new Error(value.error || `${value.command || "RPC"} failed`));
-				continue;
-			}
-			for (const listener of this.listeners) listener(value);
+		// Match Grok Build's bounded stream drain: a large RPC read must not
+		// monopolize the JS turn while keyboard data is waiting in the terminal
+		// pipe. Preserve ordering, but yield after one small batch/time slice.
+		const { lines, more } = this.lineBuffer.drain({ maxLines: 32, maxMs: 4 });
+		for (const line of lines) this.#handleStdoutLine(line);
+		if (more) {
+			this.stdoutDrainScheduled = setImmediate(() => {
+				this.stdoutDrainScheduled = undefined;
+				this.#consumeStdout("");
+			});
+			this.stdoutDrainScheduled.unref?.();
 		}
+	}
+
+	#handleStdoutLine(line) {
+		if (line.endsWith("\r")) line = line.slice(0, -1);
+		if (!line) return;
+		let value;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			this.#emitStderr(`Non-JSON output from PI: ${line}`);
+			return;
+		}
+		if (value.type === "response" && value.id && this.pending.has(value.id)) {
+			const pending = this.pending.get(value.id);
+			this.pending.delete(value.id);
+			clearTimeout(pending.timer);
+			if (value.success) pending.resolve(value.data);
+			else pending.reject(new Error(value.error || `${value.command || "RPC"} failed`));
+			return;
+		}
+		for (const listener of this.listeners) listener(value);
 	}
 
 	#consumeStderr(chunk) {

@@ -27,7 +27,7 @@
  *                               (falls back to HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy)
  */
 
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -44,6 +44,9 @@ const DEFAULT_MATCHES = [
 	"^https://auth\\.openai\\.com($|/)",
 	"^https://auth\\.x\\.ai($|/)",
 	"^https://chatgpt\\.com/backend-api/wham/",
+	// Grok Build `/usage` talks to the CLI chat proxy (billing + /user).
+	// Native fetch through a local HTTP proxy often hangs here; curl does not.
+	"^https://cli-chat-proxy\\.grok\\.com($|/)",
 ];
 
 function buildMatchers(env) {
@@ -105,17 +108,23 @@ function bodyOf(body) {
 
 /**
  * Perform a request with the `curl` binary and return a `Response`.
- * Throws a network-shaped error when curl cannot connect, so callers can
- * distinguish "unreachable" from an HTTP error status.
+ *
+ * This MUST stay asynchronous. `curl` can take seconds to tens of seconds (the
+ * proxy can hang until `--max-time`), and the quota/OAuth endpoints that reach
+ * this path are invoked from the TUI's main event loop. A synchronous
+ * `spawnSync` here freezes the entire interface — including keyboard input —
+ * while `/status`, sign-in, or a token refresh is in flight.
  */
+function abortError() {
+	const error = new Error("Request aborted");
+	error.name = "AbortError";
+	return error;
+}
+
 function curlFetch(input, init = {}, { proxy: explicitProxy } = {}) {
 	const url = urlOf(input);
-	if (!url) throw new TypeError("curl-fetch: a URL is required");
-	if (init.signal?.aborted) {
-		const error = new Error("Request aborted");
-		error.name = "AbortError";
-		throw error;
-	}
+	if (!url) return Promise.reject(new TypeError("curl-fetch: a URL is required"));
+	if (init.signal?.aborted) return Promise.reject(abortError());
 	const method = (init.method || "GET").toUpperCase();
 	const proxy = resolveProxy(explicitProxy);
 	const body = bodyOf(init.body);
@@ -125,33 +134,58 @@ function curlFetch(input, init = {}, { proxy: explicitProxy } = {}) {
 	if (body !== undefined) args.push("--data-binary", "@-");
 	args.push(url);
 
-	const result = spawnSync("curl", args, {
-		input: body !== undefined ? body : undefined,
-		encoding: "utf8",
-		maxBuffer: 64 * 1024 * 1024,
-	});
-	if (result.error) {
-		try { fs.unlinkSync(tmp); } catch {}
-		const error = new TypeError(`curl-fetch: curl failed for ${url}: ${result.error.message}`);
-		error.cause = result.error;
-		throw error;
-	}
-	const status = Number((result.stdout || "").trim() || 0);
-	let text = "";
-	try {
-		text = fs.readFileSync(tmp, "utf8");
-		fs.unlinkSync(tmp);
-	} catch {}
-	// curl exits non-zero (or reports 000) when it cannot connect at all. Surface
-	// that as a network error instead of a bogus HTTP 500 so retry logic works.
-	if (!status && result.status !== 0) {
-		const error = new TypeError(`curl-fetch: could not reach ${url}${proxy ? ` via ${proxy}` : ""}`);
-		error.cause = { code: "ECONNREFUSED" };
-		throw error;
-	}
-	return new Response(text, {
-		status: status || 500,
-		headers: { "content-type": "application/json" },
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let stdout = "";
+		let stderr = "";
+		const cleanup = () => { try { fs.unlinkSync(tmp); } catch {} };
+		const child = spawn("curl", args, { stdio: ["pipe", "pipe", "pipe"] });
+		const finish = (fn, value) => {
+			if (settled) return;
+			settled = true;
+			init.signal?.removeEventListener?.("abort", onAbort);
+			cleanup();
+			fn(value);
+		};
+		const onAbort = () => {
+			try { child.kill("SIGTERM"); } catch {}
+			finish(reject, abortError());
+		};
+		if (init.signal) init.signal.addEventListener?.("abort", onAbort, { once: true });
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => { stdout += chunk; });
+		child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-4096); });
+		child.on("error", (error) => {
+			const wrapped = new TypeError(`curl-fetch: curl failed for ${url}: ${error.message}`);
+			wrapped.cause = error;
+			finish(reject, wrapped);
+		});
+		child.on("close", (code) => {
+			if (settled) return;
+			const status = Number((stdout || "").trim() || 0);
+			let text = "";
+			try { text = fs.readFileSync(tmp, "utf8"); } catch {}
+			// curl exits non-zero (or reports 000) when it cannot connect at all.
+			// Surface that as a network error instead of a bogus HTTP 500 so retry
+			// logic works.
+			if (!status && code !== 0) {
+				const error = new TypeError(`curl-fetch: could not reach ${url}${proxy ? ` via ${proxy}` : ""}`);
+				error.cause = { code: "ECONNREFUSED", stderr };
+				finish(reject, error);
+				return;
+			}
+			finish(resolve, new Response(text, {
+				status: status || 500,
+				headers: { "content-type": "application/json" },
+			}));
+		});
+		if (body !== undefined) {
+			child.stdin.on("error", () => {});
+			child.stdin.end(body);
+		} else {
+			child.stdin.end();
+		}
 	});
 }
 

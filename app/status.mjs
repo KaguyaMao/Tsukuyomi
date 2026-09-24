@@ -249,9 +249,9 @@ export function parseUsagePayload(payload, capturedAt = Date.now()) {
 	};
 }
 
-export async function fetchGptUsage({ model, agentDir, env = process.env, fetchImpl = globalThis.fetch, now = Date.now, timeoutMs = 10_000, statusUrl, authStore: providedAuthStore } = {}) {
-	const authStore = providedAuthStore || readAuthStore(agentDir || env?.PI_CODING_AGENT_DIR);
-	const credential = selectCredential(authStore, model?.provider);
+export async function fetchGptUsage({ model, agentDir, env = process.env, fetchImpl = globalThis.fetch, now = Date.now, timeoutMs = 10_000, statusUrl, authStore: providedAuthStore, credential: providedCredential } = {}) {
+	const authStore = providedAuthStore || readAuthStore(agentDir || env?.TSUKUYOMI_DIR || env?.PI_CODING_AGENT_DIR);
+	const credential = providedCredential || selectCredential(authStore, model?.provider);
 	const capability = classifyGptStatus(model, credential, now());
 	if (capability.kind === "unsupported") return { kind: "unsupported", code: capability.code };
 	if (capability.kind === "api-key") return { kind: "unsupported", code: "api-key" };
@@ -294,7 +294,7 @@ export async function fetchGptUsage({ model, agentDir, env = process.env, fetchI
 
 export class OpenAIUsageClient {
 	constructor({ agentDir, env = process.env, fetchImpl = globalThis.fetch, ttlMs = DEFAULT_USAGE_CACHE_TTL_MS, timeoutMs = 10_000, now = Date.now, authStore } = {}) {
-		this.agentDir = agentDir || env?.PI_CODING_AGENT_DIR;
+		this.agentDir = agentDir || env?.TSUKUYOMI_DIR || env?.PI_CODING_AGENT_DIR;
 		this.env = env;
 		this.fetchImpl = fetchImpl;
 		this.ttlMs = ttlMs;

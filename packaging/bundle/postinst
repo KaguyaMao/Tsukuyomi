@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+echo "Tsukuyomi is /usr/bin/tsukuyomi"
+echo "If a source checkout still starts, run: /usr/bin/tsukuyomi --fix-path"

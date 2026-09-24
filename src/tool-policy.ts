@@ -18,14 +18,14 @@ export interface ToolPolicyApi {
 }
 
 function stateFile(): string | undefined {
-	const root = process.env.PI_CODING_AGENT_DIR;
+	const root = process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR;
 	if (!root) return undefined;
 	return join(root, "tsukuyomi-tools.json");
 }
 
 /** Previous state file name, read once so an in-place config dir keeps working. */
 function legacyStateFile(): string | undefined {
-	const root = process.env.PI_CODING_AGENT_DIR;
+	const root = process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR;
 	if (!root) return undefined;
 	return join(root, "kaguya-tools.json");
 }

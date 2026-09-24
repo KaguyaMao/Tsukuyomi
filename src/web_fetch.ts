@@ -504,7 +504,7 @@ async function readResponseBody(response: Response, maxBytes: number): Promise<A
 
 function loadConfig(): WebFetchConfig {
 	let raw: Partial<WebFetchConfig> = {};
-	const root = process.env.PI_CODING_AGENT_DIR;
+	const root = process.env.TSUKUYOMI_DIR || process.env.PI_CODING_AGENT_DIR;
 	if (root) {
 		// New name first; the legacy filename is read once for in-place upgrades.
 		for (const name of ["tsukuyomi-web.json", "kaguya-web.json"]) {

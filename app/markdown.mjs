@@ -1,3 +1,6 @@
+import { TSUKUYOMI_PALETTE } from "./design-system.mjs";
+import { createNativeHighlightStream, nativeHighlight } from "./syntax-highlight.mjs";
+
 /**
  * Self-contained Markdown renderer for the Tsukuyomi terminal UI.
  *
@@ -26,16 +29,16 @@ const UNDERLINE = `${ESC}4m`;
 
 // RGB foreground palette (r;g;b), matching tui.mjs `color`.
 const PAL = {
-	text: "235;235;235",
-	muted: "117;117;117",
-	dim: "82;82;82",
-	accent: "137;200;255",
-	secondary: "177;142;221",
-	title: "232;174;82",
-	success: "148;210;102",
-	warning: "232;174;82",
-	error: "255;116;139",
-	border: "68;68;72",
+	text: TSUKUYOMI_PALETTE.text,
+	muted: TSUKUYOMI_PALETTE.muted,
+	dim: TSUKUYOMI_PALETTE.dim,
+	accent: TSUKUYOMI_PALETTE.accent,
+	secondary: TSUKUYOMI_PALETTE.secondary,
+	title: TSUKUYOMI_PALETTE.brand,
+	success: TSUKUYOMI_PALETTE.success,
+	warning: TSUKUYOMI_PALETTE.warning,
+	error: TSUKUYOMI_PALETTE.error,
+	border: TSUKUYOMI_PALETTE.border,
 };
 
 const fg = (rgb) => `${ESC}38;2;${rgb}m`;
@@ -126,6 +129,41 @@ export function wrapAnsi(text, width, indent = "") {
 	}
 	if (hasContent) flush();
 	return lines;
+}
+
+/** Truncate an ANSI string by terminal columns without leaving an over-wide row. */
+function truncateAnsi(text, width, suffix = "…") {
+	const value = String(text ?? "");
+	const limit = Math.max(0, Math.floor(width));
+	if (visibleLength(value) <= limit) return value;
+	const suffixWidth = visibleLength(suffix);
+	const target = Math.max(0, limit - suffixWidth);
+	let out = "";
+	let used = 0;
+	for (let i = 0; i < value.length;) {
+		if (value[i] === "\x1b") {
+			let end;
+			if (value[i + 1] === "]") {
+				const terminator = value.indexOf("\x1b\\", i + 2);
+				end = terminator === -1 ? value.length : terminator + 2;
+			} else {
+				end = i + 1;
+				while (end < value.length && !/[A-Za-z]/.test(value[end])) end++;
+				if (end < value.length) end++;
+			}
+			out += value.slice(i, end);
+			i = end;
+			continue;
+		}
+		const cp = value.codePointAt(i);
+		const glyph = String.fromCodePoint(cp);
+		const glyphWidth = charWidth(cp);
+		if (used + glyphWidth > target) break;
+		out += glyph;
+		used += glyphWidth;
+		i += cp > 0xffff ? 2 : 1;
+	}
+	return `${out}${suffix}${RESET}`;
 }
 
 /** Split text into visible tokens (words) that carry any embedded SGR. */
@@ -810,26 +848,22 @@ function renderSeparator(widths, left, mid, right) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function renderCodeBlock(lines, lang, width) {
-	const rows = [];
-	const label = lang ? `${fg(PAL.secondary)}${lang}${RESET}` : "";
-	const labelWidth = visibleLength(label);
-	const topDashes = Math.max(0, width - 2 - (label ? 1 + labelWidth : 0));
-	rows.push(`${fg(PAL.border)}──${label ? ` ${label}` : ""}${"─".repeat(topDashes)}${RESET}`);
-	for (const line of lines) {
-		const hl = highlight(line, lang);
-		rows.push(`${fg(PAL.border)}│${RESET} ${hl}${RESET}`);
-	}
-	rows.push(`${fg(PAL.border)}└${"─".repeat(Math.max(1, width - 1))}${RESET}`);
-	return rows;
+	const highlighted = highlight(lines.join("\n"), lang).split("\n");
+	return renderOutputBlock({
+		header: lang || "Code",
+		sections: [{ lines: highlighted }],
+		noWrap: true,
+		width,
+	});
 }
 
 const HL = {
-	keyword: fg(PAL.accent),
-	string: fg(PAL.success),
-	number: fg(PAL.title),
-	comment: fg(PAL.muted),
-	func: fg(PAL.secondary),
-	property: fg(PAL.accent),
+	keyword: fg(TSUKUYOMI_PALETTE.syntaxKeyword),
+	string: fg(TSUKUYOMI_PALETTE.syntaxString),
+	number: fg(TSUKUYOMI_PALETTE.syntaxNumber),
+	comment: fg(TSUKUYOMI_PALETTE.syntaxComment),
+	func: fg(TSUKUYOMI_PALETTE.syntaxFunction),
+	property: fg(TSUKUYOMI_PALETTE.syntaxVariable),
 };
 
 const LANGS = {
@@ -847,9 +881,10 @@ const PY_KEYWORDS = new Set(["def","return","if","elif","else","for","while","br
 const SQL_KEYWORDS = new Set(["select","from","where","insert","into","values","update","set","delete","create","table","drop","alter","join","left","right","inner","outer","on","group","by","order","limit","offset","having","as","and","or","not","null","distinct","count","sum","avg","min","max"]);
 const C_KEYWORDS = new Set(["if","else","for","while","do","switch","case","break","continue","return","goto","struct","union","enum","typedef","sizeof","static","const","volatile","extern","register","inline","class","public","private","protected","virtual","override","final","new","delete","this","namespace","using","template","typename","try","catch","throw","throws","finally","interface","implements","extends","super","package","import","func","fn","def","let","var","val","fun","type","trait","impl","match","where","in","is","as","null","true","false","nil","None","Some","self","pub","mod","use","crate","mut","ref","unsafe","go","defer","chan","range","select","map","require","module","begin","end","rescue","ensure"]);
 
-/** Lightweight, regex-based syntax highlighter. Returns an SGR string; the
- *  caller appends a reset. Unknown languages pass through unhighlighted. */
+/** OMP Syntect highlighting with the previous scanner as a portable fallback. */
 export function highlight(code, lang) {
+	const native = nativeHighlight(code, lang);
+	if (native !== undefined) return native;
 	const normalized = lang ? LANGS[lang.toLowerCase()] : undefined;
 	if (!normalized) return `${BASE}${code}`;
 	if (normalized === "json") return highlightJson(code);
@@ -862,6 +897,103 @@ export function highlight(code, lang) {
 	if (normalized === "python") return highlightClike(code, PY_KEYWORDS);
 	if (normalized === "javascript" || normalized === "typescript") return highlightClike(code, JS_KEYWORDS);
 	return highlightClike(code, C_KEYWORDS);
+}
+
+/** OMP-style standalone frame shared by Markdown code and execution output. */
+export function renderOutputBlock({ header = "", meta = "", state, sections = [], width = 80, noWrap = false } = {}) {
+	const columns = Math.max(5, Math.floor(width));
+	const innerWidth = Math.max(1, columns - 4);
+	const borderColor = state === "error" ? PAL.error
+		: state === "warning" ? PAL.warning
+			: ["running", "pending"].includes(state) ? PAL.accent : PAL.border;
+	const border = fg(borderColor);
+	const bgColor = ["running", "pending"].includes(state) ? TSUKUYOMI_PALETTE.toolPending
+		: state === "error" ? TSUKUYOMI_PALETTE.toolError
+			: state === "success" || state === "done" ? TSUKUYOMI_PALETTE.toolSuccess : undefined;
+	const bgOpen = bgColor ? bg(bgColor) : "";
+	const paintRow = (value) => {
+		if (!bgOpen) return value;
+		const stable = value.replace(/\x1b\[(?:0)?m/g, (match) => `${match}${bgOpen}`).replace(/\x1b\[49m/g, `${ESC}49m${bgOpen}`);
+		return `${bgOpen}${stable}${ESC}49m`;
+	};
+	const fit = (value) => {
+		const clipped = truncateAnsi(value, innerWidth);
+		return `${clipped}${" ".repeat(Math.max(0, innerWidth - visibleLength(clipped)))}`;
+	};
+	const title = [header, meta].filter(Boolean).join(" · ");
+	const availableTitle = Math.max(0, columns - 6);
+	const titleText = availableTitle > 0 ? truncateAnsi(title, availableTitle) : "";
+	const titleSpan = titleText ? ` ${titleText} ` : "";
+	const topCap = "╭───";
+	const topFill = Math.max(0, columns - visibleLength(topCap) - visibleLength(titleSpan) - 1);
+	const rows = [paintRow(`${border}${topCap}${titleSpan}${"─".repeat(topFill)}╮${RESET}`)];
+	const normalized = sections.length ? sections : [{ lines: [] }];
+	for (let index = 0; index < normalized.length; index++) {
+		const section = normalized[index];
+		if (index > 0 || section.label) {
+			const label = section.label ? ` ${section.label} ` : "";
+			const sectionCap = "├───";
+			rows.push(paintRow(`${border}${sectionCap}${label}${"─".repeat(Math.max(0, columns - visibleLength(sectionCap) - visibleLength(label) - 1))}┤${RESET}`));
+		}
+		for (const source of section.lines || []) {
+			const raw = String(source).trimEnd();
+			const wrapped = noWrap ? [raw] : wrapAnsi(raw, innerWidth);
+			for (const line of wrapped.length ? wrapped : [""]) {
+				rows.push(paintRow(`${border}│${RESET} ${fit(line)} ${border}│${RESET}`));
+			}
+		}
+	}
+	const bottomCap = "╰───";
+	rows.push(paintRow(`${border}${bottomCap}${"─".repeat(Math.max(0, columns - visibleLength(bottomCap) - 1))}╯${RESET}`));
+	return rows;
+}
+
+/** Render a growing fenced block without restarting Syntect for every token. */
+export function renderStreamingCodeBlock(text, { width = 80, streamState = {} } = {}) {
+	const opening = /^\s*(`{3,}|~{3,})([^\r\n]*)\r?\n/.exec(String(text || ""));
+	if (!opening) return undefined;
+	const marker = opening[1][0];
+	const markerLength = opening[1].length;
+	const language = opening[2].trim().split(/\s+/, 1)[0] || "";
+	const bodyLines = String(text).slice(opening[0].length).split(/\r?\n/);
+	const closePattern = new RegExp(`^[ \\t]*${marker}{${markerLength},}[ \\t]*$`);
+	const closeIndex = bodyLines.findIndex((line) => closePattern.test(line));
+	// Once prose follows the closing fence this helper would otherwise hide it;
+	// let the complete Markdown renderer own mixed blocks in that case.
+	if (closeIndex !== -1 && bodyLines.slice(closeIndex + 1).some((line) => line.trim())) return undefined;
+	const codeLines = closeIndex === -1 ? bodyLines : bodyLines.slice(0, closeIndex);
+	const code = codeLines.join("\n");
+	const closed = closeIndex !== -1;
+	const codeToFeed = closed ? (code ? `${code}\n` : "") : code;
+
+	if (streamState.key !== `${markerLength}:${language}` || codeToFeed.length < (streamState.fedLength || 0)) {
+		streamState.key = `${markerLength}:${language}`;
+		streamState.fedLength = 0;
+		streamState.highlighted = "";
+		streamState.stream = createNativeHighlightStream(language);
+	}
+
+	let highlighted;
+	if (streamState.stream) {
+		const lastNewline = codeToFeed.lastIndexOf("\n");
+		const completeLength = closed ? codeToFeed.length : Math.max(0, lastNewline + 1);
+		if (completeLength > streamState.fedLength) {
+			const chunk = codeToFeed.slice(streamState.fedLength, completeLength);
+			streamState.highlighted += streamState.stream.push(chunk);
+			streamState.fedLength = completeLength;
+		}
+		const pending = codeToFeed.slice(streamState.fedLength);
+		highlighted = `${streamState.highlighted}${pending ? highlight(pending, language) : ""}`;
+	} else {
+		highlighted = highlight(code, language);
+	}
+
+	return renderOutputBlock({
+		header: language || "Code",
+		sections: [{ lines: highlighted.split("\n").filter((line, index, rows) => index < rows.length - 1 || line) }],
+		noWrap: true,
+		width,
+	});
 }
 
 function highlightClike(code, keywords) {

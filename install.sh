@@ -32,8 +32,8 @@ ln -sfn "${ROOT}/bin/tsukuyomi.mjs" "${TSK}"
 ln -sfn "${ROOT}/bin/kaguyapi.mjs" "${LEGACY}"
 
 if ! command -v pi >/dev/null 2>&1; then
-  echo "Warning: \`pi\` is not on PATH. Tsukuyomi wraps Pi and needs it installed."
-  echo "  npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+  echo "Note: no system \`pi\` on PATH. Tsukuyomi now bundles the PI kernel as a"
+  echo "  dependency, so this is fine; it uses its own pinned copy."
 fi
 
 VERSION="$(node -e "console.log(require('${ROOT}/package.json').version)")"

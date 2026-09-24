@@ -21,7 +21,7 @@ export function registerTasks(pi: ExtensionAPI) {
 		async execute(id, params, signal, update, ctx) { const job = await client.request("pty.start", { ...params, cwd: ctx.cwd, toolCallId: id }); return params.background ? { content: [{ type: "text", text: `Background task ${job.id}` }], details: { ...job, jobId: job.id } } : wait(job, signal, update); },
 	});
 	pi.registerTool({ name: "subagent", label: "Subagents / 子代理", description: "Optional user-controlled subagents. Disabled by default; only the user may enable them in /tools. Start isolated work with task and readonly; inspect the returned patch, then action:apply to integrate and validate. Maximum 3 workers, no recursive delegation. action:get/cancel/steer use id.",
-		parameters: Type.Object({ action: Type.Optional(Type.String()), task: Type.Optional(Type.String()), readonly: Type.Optional(Type.Boolean()), id: Type.Optional(Type.String()), message: Type.Optional(Type.String()) }),
+		parameters: Type.Object({ action: Type.Optional(Type.String()), task: Type.Optional(Type.String()), readonly: Type.Optional(Type.Boolean()), id: Type.Optional(Type.String()), message: Type.Optional(Type.String()), accountRef: Type.Optional(Type.String({ description: "Account id or provider:id for this isolated worker" })) }),
 		async execute(id, params, signal, update, ctx) {
 			if (params.action && params.action !== "start") { const result = await client.request(params.action, params); return { content: [{ type: "text", text: JSON.stringify(result) }], details: result }; }
 			if (!params.task?.trim()) throw new Error("task is required");

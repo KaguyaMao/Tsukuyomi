@@ -91,6 +91,8 @@ test("curl-fetch matches OAuth and quota hosts but never streaming endpoints", (
 	assert.equal(hook.shouldIntercept("https://auth.x.ai/oauth2/device/code"), true);
 	assert.equal(hook.shouldIntercept("https://auth.x.ai/oauth2/token"), true);
 	assert.equal(hook.shouldIntercept("https://chatgpt.com/backend-api/wham/usage"), true);
+	assert.equal(hook.shouldIntercept("https://cli-chat-proxy.grok.com/v1/billing?format=credits"), true);
+	assert.equal(hook.shouldIntercept("https://cli-chat-proxy.grok.com/v1/user?include=subscription"), true);
 	// Streaming model endpoints must never be routed through curl: a single
 	// non-chunked body would break incremental output.
 	assert.equal(hook.shouldIntercept("https://chatgpt.com/backend-api/codex/responses"), false);

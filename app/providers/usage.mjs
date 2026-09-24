@@ -25,13 +25,14 @@
  *   - OpenRouter: `GET https://openrouter.ai/api/v1/key` (API key).
  *   - DeepSeek: `GET https://api.deepseek.com/user/balance` (API key).
  *
- * Not available as an API:
- *   - xAI/Grok: usage lives in the console (`console.x.ai/usage`) or in the
- *     subscription's weekly pool (Settings -> Usage). Rate limits are returned
- *     as `x-ratelimit-*` headers on model calls, not as a quota endpoint.
+ *   - xAI/Grok OAuth: Grok Build's CLI chat proxy
+ *     `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
+ *     (same request as `x.ai/billing` in grok-build). API keys have no
+ *     consumer quota endpoint.
  *   - Anthropic with an API key: usage lives in the console.
  */
 
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { fetchGptUsage, USAGE_PAGE_URL } from "../status.mjs";
@@ -208,7 +209,7 @@ export const quotaAdapters = {
 		},
 	},
 
-	/** Grok Build's own `/usage` data comes from its CLI chat proxy. */
+		/** Grok Build's own `/usage` data comes from its CLI chat proxy. */
 	xai: {
 		id: "xai",
 		hosts: ["api.x.ai", "grok.com"],
@@ -226,6 +227,53 @@ function resetAtOf(value, capturedAt) {
 	if (seconds == null) return undefined;
 	// Accept epoch seconds as well as milliseconds.
 	return seconds < 100_000_000_000 ? seconds * 1_000 : seconds;
+}
+
+export const GROK_CLI_CHAT_PROXY_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
+export const GROK_TOKEN_AUTH = "xai-grok-cli";
+export const GROK_CLIENT_VERSION = "1.0.32";
+export const GROK_CLIENT_IDENTIFIER = "grok-shell";
+
+function decodeJwtPayload(token) {
+	try {
+		const part = String(token || "").split(".")[1];
+		if (!part) return undefined;
+		const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+		return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** `x-userid` from a Grok OAuth access token (`principal_id`, else `sub`). */
+export function xaiUserIdFromAccessToken(access) {
+	const payload = decodeJwtPayload(access);
+	const id = payload?.principal_id || payload?.sub;
+	return typeof id === "string" && id.trim() ? id : undefined;
+}
+
+function centValue(value) {
+	if (value == null) return undefined;
+	if (typeof value === "object") return finiteNumber(value.val);
+	return finiteNumber(value);
+}
+
+/**
+ * Headers Grok Build sends on every CLI chat-proxy billing request.
+ * `X-XAI-Token-Auth` is required so nginx routes the request to OAuth;
+ * without it the proxy can hang until our abort timer fires.
+ */
+export function grokProxyHeaders({ token, userId, env = {} } = {}) {
+	const headers = {
+		Accept: "application/json",
+		Authorization: `Bearer ${token}`,
+		"X-XAI-Token-Auth": env.GROK_TOKEN_HEADER || GROK_TOKEN_AUTH,
+		"x-grok-client-version": env.GROK_CLIENT_VERSION || GROK_CLIENT_VERSION,
+		"x-grok-client-identifier": env.GROK_CLIENT_NAME || GROK_CLIENT_IDENTIFIER,
+		"x-grok-client-mode": "interactive",
+	};
+	if (userId) headers["x-userid"] = userId;
+	return headers;
 }
 
 /**
@@ -255,18 +303,27 @@ export function parseXaiSubscriptions(payload) {
 /** Normalize the billing payload used by Grok Build's `/usage` modal. */
 export function parseXaiBilling(payload, capturedAt = Date.now()) {
 	const config = payload?.config;
-	const usedPercent = percent(config?.creditUsagePercent);
-	const period = config?.currentPeriod;
-	if (usedPercent == null || !period) return undefined;
-	const start = resetAtOf(period.start, capturedAt);
-	const end = resetAtOf(period.end, capturedAt);
+	if (!config || typeof config !== "object") return undefined;
+	const period = config.currentPeriod || config.current_period || {};
+	let usedPercent = percent(config.creditUsagePercent ?? config.credit_usage_percent);
+	if (usedPercent == null) {
+		const limit = centValue(config.monthlyLimit ?? config.monthly_limit);
+		const used = centValue(config.used);
+		if (limit > 0 && used != null) usedPercent = percent(used / limit * 100);
+	}
+	if (usedPercent == null) return undefined;
+	const start = resetAtOf(period.start ?? config.billingPeriodStart ?? config.billing_period_start, capturedAt);
+	const end = resetAtOf(period.end ?? config.billingPeriodEnd ?? config.billing_period_end, capturedAt);
+	const prepaid = centValue(config.prepaidBalance ?? config.prepaid_balance);
 	return {
 		usedPercent,
 		remainingPercent: Math.max(0, 100 - usedPercent),
 		windowSeconds: start != null && end != null && end > start ? (end - start) / 1000 : undefined,
 		resetAt: end,
-		periodType: String(period.type || "").replace(/^USAGE_PERIOD_TYPE_/, "").toLowerCase() || undefined,
-		products: Array.isArray(config.productUsage) ? config.productUsage : [],
+		periodType: String(period.type || period.periodType || "").replace(/^USAGE_PERIOD_TYPE_/, "").toLowerCase() || undefined,
+		products: Array.isArray(config.productUsage) ? config.productUsage : Array.isArray(config.product_usage) ? config.product_usage : [],
+		prepaidBalance: prepaid,
+		subscriptionTier: payload.subscriptionTier || payload.subscription_tier || undefined,
 	};
 }
 
@@ -276,11 +333,12 @@ export class ProviderUsageClient {
 		// the configured proxy instead of surfacing "fetch failed".
 		const fetcher = fetchImpl ?? createProxyAwareFetch({ env });
 		// Resolve the credential directory the same way the rest of the app does
-		// (tui.mjs reads PI_CODING_AGENT_DIR and falls back to ~/.tsukuyomi/agent).
+		// (tui.mjs reads the Tsukuyomi-owned canonical root).
 		// Without this, a missing env var would make credential lookup fail and the
 		// status view would wrongly report "no public endpoint" instead of the
 		// real subscription plan.
 		const resolvedAgentDir = agentDir
+			|| env?.TSUKUYOMI_DIR
 			|| env?.PI_CODING_AGENT_DIR
 			|| join(process.env.HOME || "", ".tsukuyomi", "agent");
 		Object.assign(this, { agentDir: resolvedAgentDir, env, resolveAuth, fetchImpl: fetcher, now, ttlMs, timeoutMs });
@@ -309,15 +367,18 @@ export class ProviderUsageClient {
 		// Codex keeps its own resolver: it honours the status-URL override and
 		// understands the ChatGPT usage payload.
 		if (provider === "openai-codex") {
-			return this.#cached(model, credential, force, async () =>
-				fetchGptUsage({
+			return this.#cached(model, credential, force, async () => {
+				const resolved = await this.#resolveCredential(model, credential);
+				return fetchGptUsage({
 					model,
 					authStore,
+					credential: resolved.credential,
 					env: this.env,
 					fetchImpl: this.fetchImpl,
 					now: this.now,
 					timeoutMs: this.timeoutMs,
-				}));
+				});
+			});
 		}
 
 		// xAI/Grok: the consumer subscription plan is readable with the OAuth
@@ -356,14 +417,35 @@ export class ProviderUsageClient {
 			this.#requestAdapter({ adapter, model, credential, credentialType }));
 	}
 
+	async #resolveCredential(model, credential) {
+		if (!this.resolveAuth) return { credential, resolved: undefined };
+		try {
+			const resolved = await this.resolveAuth(model);
+			const key = resolved?.auth?.apiKey;
+			if (!key || !credential) return { credential, resolved };
+			// PI may have just refreshed an OAuth access token.  Keep metadata
+			// such as accountId, but clear a stale expires so status checks do
+			// not reject a token the runtime already considers usable.
+			const next = credential.type === "oauth"
+				? { ...credential, access: key, expires: Math.max(Number(credential.expires) || 0, this.now() + 60_000) }
+				: { ...credential, key };
+			return { credential: next, resolved };
+		} catch {
+			// Status/quota is best effort.  A stale token may still be accepted,
+			// while a transient refresh failure should not hide the endpoint.
+			return { credential, resolved: undefined };
+		}
+	}
+
 	async #requestAdapter({ adapter, model, credential, credentialType }) {
-		const resolved = await this.resolveAuth?.(model);
+		const resolved = await this.#resolveCredential(model, credential);
+		const effectiveCredential = resolved.credential;
 		const key = credentialType === "oauth"
-			? credential.access
-			: (resolved?.auth?.apiKey || credential.key);
+			? (effectiveCredential?.access || credential.access)
+			: (resolved.resolved?.auth?.apiKey || effectiveCredential?.key || credential.key);
 		if (!key) return { kind: "unsupported", code: "no-auth", provider: adapter.id };
 
-		const { url, headers, method, body } = adapter.request({ model, credential, resolved, key, env: this.env });
+		const { url, headers, method, body } = adapter.request({ model, credential: effectiveCredential, resolved: resolved.resolved, key, env: this.env });
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 		try {
@@ -405,7 +487,7 @@ export class ProviderUsageClient {
 	 * calls), so they fall back to "no-endpoint". OAuth accounts use Grok Build's
 	 * CLI chat proxy billing endpoints for the same data shown by `/usage`.
 	 */
-	async #requestXai({ credential, credentialType }) {
+	async #requestXai({ model, credential, credentialType }) {
 		if (credentialType !== "oauth") {
 			return {
 				kind: "unsupported",
@@ -414,34 +496,58 @@ export class ProviderUsageClient {
 				pageUrl: credentialType === "api_key" ? "https://console.x.ai/usage" : "https://grok.com/?_s=usage",
 			};
 		}
-		const token = credential?.access;
+		const resolved = await this.#resolveCredential(model, credential);
+		const token = resolved.credential?.access;
 		if (!token) {
 			return { kind: "unsupported", code: "no-auth", provider: "xai", pageUrl: "https://grok.com/?_s=usage" };
 		}
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+		const base = String(this.env.GROK_CLI_CHAT_PROXY_BASE_URL || GROK_CLI_CHAT_PROXY_BASE_URL).replace(/\/$/, "");
+		const headers = grokProxyHeaders({
+			token,
+			userId: xaiUserIdFromAccessToken(token),
+			env: this.env,
+		});
+		const fetchOne = async (url) => {
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+			try {
+				return await this.fetchImpl(url, { method: "GET", headers, signal: controller.signal, redirect: "error" });
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+		// `/user` is enrichment only. Grok Build's `/usage` is billed from
+		// `/billing?format=credits`; waiting on a hung `/user` used to surface
+		// a timeout even after billing had already returned.
+		let userPayload;
+		const userPromise = fetchOne(`${base}/user?include=subscription`)
+			.then(async (response) => {
+				if (!response?.ok) return undefined;
+				return response.json().catch(() => undefined);
+			})
+			.then((payload) => { userPayload = payload; return payload; })
+			.catch(() => undefined);
 		try {
-			const base = String(this.env.GROK_CLI_CHAT_PROXY_BASE_URL || "https://cli-chat-proxy.grok.com/v1").replace(/\/$/, "");
-			const headers = { Accept: "application/json", Authorization: `Bearer ${token}`, "User-Agent": "grok-cli/1.0.30" };
-			const [billingResponse, userResponse] = await Promise.all([
-				this.fetchImpl(`${base}/billing?format=credits`, { method: "GET", headers, signal: controller.signal, redirect: "error" }),
-				this.fetchImpl(`${base}/user?include=subscription`, { method: "GET", headers, signal: controller.signal, redirect: "error" }),
-			]);
-			if ([billingResponse, userResponse].some((response) => response.status === 401 || response.status === 403)) {
+			const billingResponse = await fetchOne(`${base}/billing?format=credits`);
+			if (billingResponse.status === 401 || billingResponse.status === 403) {
 				return { kind: "unsupported", code: "expired-auth", provider: "xai", pageUrl: "https://grok.com/?_s=usage" };
 			}
 			if (!billingResponse.ok) return { kind: "error", code: "http", status: billingResponse.status, provider: "xai" };
 			const billing = parseXaiBilling(await billingResponse.json().catch(() => null), this.now());
 			if (!billing) return { kind: "error", code: "malformed", provider: "xai" };
-			const user = userResponse.ok ? await userResponse.json().catch(() => null) : null;
+			await Promise.race([userPromise, Promise.resolve()]);
+			const user = userPayload && typeof userPayload === "object" ? userPayload : undefined;
+			const tier = user?.subscriptionTier || user?.subscription_tier || billing.subscriptionTier;
 			const products = billing.products
 				.filter((item) => item?.product && finiteNumber(item?.usagePercent) != null)
 				.map((item) => `${item.product}: ${percent(item.usagePercent)}%`).join(" · ");
 			const productName = billing.products.find((item) => item?.product)?.product;
+			const prepaid = billing.prepaidBalance;
 			return {
 				kind: "available",
-				plan: { tier: user?.subscriptionTier, status: user?.hasGrokCodeAccess === false ? "unavailable" : "active" },
+				plan: { tier: tier || undefined, status: "active" },
 				windows: [{ kind: "primary", bucketName: productName || billing.periodType || "grok", usedPercent: billing.usedPercent, remainingPercent: billing.remainingPercent, windowSeconds: billing.windowSeconds, resetAt: billing.resetAt }],
+				credits: prepaid != null && prepaid > 0 ? { hasCredits: true, balance: `$${(prepaid / 100).toFixed(2)}` } : undefined,
 				pageUrl: "https://grok.com/?_s=usage",
 				note: products || undefined,
 				provider: "xai",
@@ -455,8 +561,6 @@ export class ProviderUsageClient {
 				return { kind: "error", code: "network", provider: "xai", reason: error.message };
 			}
 			return { kind: "error", code: "http", provider: "xai", reason: error instanceof Error ? error.message : String(error) };
-		} finally {
-			clearTimeout(timer);
 		}
 	}
 

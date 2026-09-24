@@ -122,6 +122,17 @@ export function credentialLifetime(credential, now = Date.now()) {
 	return { valid: true, expired: expires <= now, expires };
 }
 
+/** Write a complete credential store atomically. */
+export function writeAuthStore(agentDir, store) {
+	if (!store || typeof store !== "object" || Array.isArray(store)) {
+		throw authError(AuthErrorCode.CONFIG, "Invalid auth store");
+	}
+	for (const [providerId, credential] of Object.entries(store)) {
+		if (!isCredential(credential)) throw authError(AuthErrorCode.CONFIG, `Invalid credential for provider "${providerId}"`);
+	}
+	return writeJsonAtomic(authFilePath(agentDir), store);
+}
+
 /** Write one credential, preserving the rest of the store. */
 export function writeStoredCredential(agentDir, providerId, credential) {
 	if (!isCredential(credential)) {

@@ -1,0 +1,16 @@
+pkgname=tsukuyomi
+pkgver=@VERSION@
+pkgrel=@RELEASE@
+pkgdesc='Independent coding-agent TUI with bundled Pi @PI_VERSION@ and Node.js @NODE_VERSION@'
+arch=('x86_64')
+url='https://github.com/KaguyaMao/Tsukuyomi'
+license=('MIT' 'ISC' 'Apache-2.0' 'BSD-2-Clause' 'BSD-3-Clause')
+depends=('glibc>=2.28' 'gcc-libs' 'bash' 'ca-certificates' 'ripgrep' 'git')
+optdepends=('socat: PTY RPC transport' 'wl-clipboard: Wayland clipboard' 'xclip: X11 clipboard')
+options=('!strip' '!debug')
+install=tsukuyomi.install
+source=('tsukuyomi-bundle.tar.gz')
+sha256sums=('SKIP')
+package() {
+    cp -a --no-preserve=ownership "${srcdir}/usr" "${pkgdir}/"
+}
