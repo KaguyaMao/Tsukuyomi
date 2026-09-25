@@ -10,11 +10,18 @@ OUT="${BUNDLE_OUTPUT:-$ROOT/dist/packages}"
 WORK="${BUNDLE_WORK:-$OUT/bundle-work}"
 RELEASE="${PACKAGE_RELEASE:-1}"
 DIRECT_BUILD="${TSUKUYOMI_DIRECT_BUILD:-0}"
+BUILD_RPM="${TSUKUYOMI_BUILD_RPM:-1}"
+BUILD_ARCH="${TSUKUYOMI_BUILD_ARCH:-1}"
+
+for target in "$BUILD_RPM" "$BUILD_ARCH"; do
+	[[ "$target" == 0 || "$target" == 1 ]] || { echo 'TSUKUYOMI_BUILD_RPM and TSUKUYOMI_BUILD_ARCH must be 0 or 1.' >&2; exit 1; }
+done
 
 [[ "$(uname -m)" == x86_64 ]] || { echo 'Bundled packages currently support Linux x86_64 only.' >&2; exit 1; }
 REQUIRED_COMMANDS=(ar md5sum objdump python3 tar xz)
 if [[ "$DIRECT_BUILD" == 1 ]]; then
-	REQUIRED_COMMANDS+=(rpmbuild makepkg)
+	[[ "$BUILD_RPM" == 0 ]] || REQUIRED_COMMANDS+=(rpmbuild)
+	[[ "$BUILD_ARCH" == 0 ]] || REQUIRED_COMMANDS+=(makepkg)
 else
 	REQUIRED_COMMANDS+=(podman)
 fi
@@ -148,31 +155,38 @@ DEB_FILE="$OUT/tsukuyomi_${VERSION}-${RELEASE}_amd64.deb"; rm -f "$DEB_FILE"
 (cd "$DEB_ARCHIVE" && ar crD "$DEB_FILE" debian-binary control.tar.xz data.tar.xz)
 
 if [[ "$DIRECT_BUILD" == 1 ]]; then
-	(
-		mkdir -p "$WORK/rpm"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-		cp "$WORK/tsukuyomi-bundle.tar.gz" "$WORK/rpm/SOURCES/"
-		RPM_ROOT="${RPM_CONFIGDIR:-/usr/lib/rpm}"
-		RPM_CONFIGDIR="$RPM_ROOT" rpmbuild \
-			--rcfile="$RPM_ROOT/rpmrc" \
-			--macros="$RPM_ROOT/macros" \
-			--dbpath="$WORK/rpm/db" \
-			-bb \
-			--define "_rpmconfigdir $RPM_ROOT" \
-			--define "_topdir $WORK/rpm" \
-			--define "__os_install_post %{nil}" \
-			--define "_binary_payload w6.zstdio" "$WORK/tsukuyomi.spec"
-		mkdir -p "$WORK/arch"
-		cp "$WORK/PKGBUILD" "$WORK/tsukuyomi.install" "$WORK/tsukuyomi-bundle.tar.gz" "$WORK/arch/"
-		if [[ -n "${TSUKUYOMI_FAKED:-}" ]]; then
-			fakeroot() {
-				"${TSUKUYOMI_FAKEROOT_COMMAND:-fakeroot}" \
-					--lib "${TSUKUYOMI_FAKEROOT_LIB:?TSUKUYOMI_FAKEROOT_LIB is required with TSUKUYOMI_FAKED}" \
-					--faked "$TSUKUYOMI_FAKED" "$@"
-			}
-			export -f fakeroot
-		fi
-		(cd "$WORK/arch" && PKGEXT=.pkg.tar.zst MAKEPKG_LIBRARY="${MAKEPKG_LIBRARY:-/usr/share/makepkg}" makepkg --nodeps --force --config "${MAKEPKG_CONF:-/etc/makepkg.conf}")
-	) > "$OUT/build.log" 2>&1
+	: > "$OUT/build.log"
+	if [[ "$BUILD_RPM" == 1 ]]; then
+		(
+			mkdir -p "$WORK/rpm"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+			cp "$WORK/tsukuyomi-bundle.tar.gz" "$WORK/rpm/SOURCES/"
+			RPM_ROOT="${RPM_CONFIGDIR:-/usr/lib/rpm}"
+			RPM_CONFIGDIR="$RPM_ROOT" rpmbuild \
+				--rcfile="$RPM_ROOT/rpmrc" \
+				--macros="$RPM_ROOT/macros" \
+				--dbpath="$WORK/rpm/db" \
+				-bb \
+				--define "_rpmconfigdir $RPM_ROOT" \
+				--define "_topdir $WORK/rpm" \
+				--define "__os_install_post %{nil}" \
+				--define "_binary_payload w6.zstdio" "$WORK/tsukuyomi.spec"
+		) > "$OUT/build.log" 2>&1
+	fi
+	if [[ "$BUILD_ARCH" == 1 ]]; then
+		(
+			mkdir -p "$WORK/arch"
+			cp "$WORK/PKGBUILD" "$WORK/tsukuyomi.install" "$WORK/tsukuyomi-bundle.tar.gz" "$WORK/arch/"
+			if [[ -n "${TSUKUYOMI_FAKED:-}" ]]; then
+				fakeroot() {
+					"${TSUKUYOMI_FAKEROOT_COMMAND:-fakeroot}" \
+						--lib "${TSUKUYOMI_FAKEROOT_LIB:?TSUKUYOMI_FAKEROOT_LIB is required with TSUKUYOMI_FAKED}" \
+						--faked "$TSUKUYOMI_FAKED" "$@"
+				}
+				export -f fakeroot
+			fi
+			(cd "$WORK/arch" && PKGEXT=.pkg.tar.zst MAKEPKG_LIBRARY="${MAKEPKG_LIBRARY:-/usr/share/makepkg}" makepkg --nodeps --force --config "${MAKEPKG_CONF:-/etc/makepkg.conf}")
+		) >> "$OUT/build.log" 2>&1
+	fi
 else
 	podman run --rm -v "$WORK:/build:Z" "$IMAGE" bash -euxc '
 		mkdir -p /build/rpm/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
@@ -187,12 +201,23 @@ else
 	' > "$OUT/build.log" 2>&1
 fi
 
-RPM_FILE="$(find "$WORK/rpm/RPMS/x86_64" -maxdepth 1 -name "tsukuyomi-${VERSION}-${RELEASE}*.rpm" -print -quit)"
-ARCH_FILE="$(find "$WORK/arch" -maxdepth 1 -name "tsukuyomi-${VERSION}-${RELEASE}-x86_64.pkg.tar.zst" -print -quit)"
-[[ -n "$RPM_FILE" && -n "$ARCH_FILE" ]] || { echo 'RPM or Arch package was not produced.' >&2; exit 1; }
-cp "$RPM_FILE" "$ARCH_FILE" "$OUT/"
+RPM_FILE=""
+ARCH_FILE=""
+if [[ "$BUILD_RPM" == 1 ]]; then
+	RPM_FILE="$(find "$WORK/rpm/RPMS/x86_64" -maxdepth 1 -name "tsukuyomi-${VERSION}-${RELEASE}*.rpm" -print -quit)"
+	[[ -n "$RPM_FILE" ]] || { echo 'RPM package was not produced.' >&2; exit 1; }
+	cp "$RPM_FILE" "$OUT/"
+fi
+if [[ "$BUILD_ARCH" == 1 ]]; then
+	ARCH_FILE="$(find "$WORK/arch" -maxdepth 1 -name "tsukuyomi-${VERSION}-${RELEASE}-x86_64.pkg.tar.zst" -print -quit)"
+	[[ -n "$ARCH_FILE" ]] || { echo 'Arch package was not produced.' >&2; exit 1; }
+	cp "$ARCH_FILE" "$OUT/"
+fi
 cp "$WORK/tsukuyomi-bundle.tar.gz" "$OUT/"
 cp "$WORK/PKGBUILD" "$WORK/tsukuyomi.spec" "$WORK/debian-control" "$OUT/"
-RPM_OUT="$OUT/$(basename "$RPM_FILE")"; ARCH_OUT="$OUT/$(basename "$ARCH_FILE")"
-(cd "$OUT" && sha256sum "$(basename "$ARCH_OUT")" "$(basename "$RPM_OUT")" "$(basename "$DEB_FILE")" > SHA256SUMS)
+PACKAGE_FILES=("$DEB_FILE")
+[[ ! -f "$OUT/tsukuyomi-${VERSION}.tgz" ]] || PACKAGE_FILES+=("$OUT/tsukuyomi-${VERSION}.tgz")
+[[ -z "$RPM_FILE" ]] || PACKAGE_FILES+=("$OUT/$(basename "$RPM_FILE")")
+[[ -z "$ARCH_FILE" ]] || PACKAGE_FILES+=("$OUT/$(basename "$ARCH_FILE")")
+(cd "$OUT" && sha256sum "${PACKAGE_FILES[@]##*/}" > SHA256SUMS)
 printf 'Packages written to %s\n' "$OUT"

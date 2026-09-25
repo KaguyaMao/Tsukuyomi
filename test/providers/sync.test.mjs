@@ -95,6 +95,28 @@ test("syncProviderToModelsJson writes PI models.json", () => {
 	assert.equal(config.providers.synced.baseUrl, "https://s.dev");
 });
 
+test("custom model-list edits persist and sync their ids and limits to models.json", () => {
+	const dir = agentDir();
+	saveProviderConfig(dir, "relay", {
+		api: "openai-completions",
+		baseURL: "https://relay.dev/v1",
+		models: [{ id: "old-model", name: "Old model" }],
+	});
+	const updated = normalizeProvider("relay", {
+		api: "openai-completions",
+		baseURL: "https://relay.dev/v1",
+		models: [{ id: "new-model", name: "New model", reasoning: true, contextWindow: 64000, maxTokens: 8192 }],
+	});
+	saveProviderConfig(dir, "relay", updated);
+	syncProviderToModelsJson(dir, "relay", updated);
+
+	const { config } = loadModelsJson(dir);
+	assert.deepEqual(config.providers.relay.models.map((model) => model.id), ["new-model"]);
+	assert.equal(config.providers.relay.models[0].reasoning, true);
+	assert.equal(config.providers.relay.models[0].contextWindow, 64000);
+	assert.equal(config.providers.relay.models[0].maxTokens, 8192);
+});
+
 test("importFromModelsJson pulls models.json-only providers into providers.json", () => {
 	const dir = agentDir();
 	upsertModelsProvider(dir, "handwritten", {

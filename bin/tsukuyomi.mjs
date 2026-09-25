@@ -131,7 +131,7 @@ if (rawArgs.includes("--tsukuyomi-version") || rawArgs[0] === "-V") {
 const piBin = findPi({ root: ROOT, home: HOME });
 if (!piBin) {
 	console.error("Tsukuyomi: could not find the bundled PI kernel.");
-	console.error("Reinstall Tsukuyomi (npm install -g --ignore-scripts tsukuyomi) to restore it,");
+	console.error("Reinstall Tsukuyomi (npm install -g tsukuyomi@0.6.2) to restore it,");
 	console.error("or point TSUKUYOMI_PI at an existing PI installation.");
 	process.exit(1);
 }

@@ -2,20 +2,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createTsukuyomiDesignSystem, TSUKUYOMI_PALETTE, renderListRow, statusToken } from "../app/design-system.mjs";
 
-test("shared design system preserves Tsukuyomi brand tokens", () => {
-	assert.equal(TSUKUYOMI_PALETTE.canvas, "18;18;18");
-	assert.equal(TSUKUYOMI_PALETTE.brand, "212;192;144");
+test("shared design system uses the Mocha surfaces and gold Ti brand", () => {
+	assert.equal(TSUKUYOMI_PALETTE.canvas, "30;30;46");
+	assert.equal(TSUKUYOMI_PALETTE.brand, "249;226;175");
 	const design = createTsukuyomiDesignSystem();
-	assert.match(design.fg.brand("Tsukuyomi"), /38;2;212;192;144m/);
-	assert.match(design.backgrounds.canvas, /48;2;18;18;18m/);
-	assert.equal(TSUKUYOMI_PALETTE.panelHover, "0;130;179");
-	assert.equal(TSUKUYOMI_PALETTE.band, "24;28;36");
-	assert.equal(TSUKUYOMI_PALETTE.borderMuted, "78;88;104");
-	assert.equal(TSUKUYOMI_PALETTE.border, "112;122;138");
-	assert.equal(TSUKUYOMI_PALETTE.tool, "25;30;39");
-	assert.equal(TSUKUYOMI_PALETTE.toolPending, "24;38;55");
+	assert.match(design.fg.brand("Ti"), /38;2;249;226;175m/);
+	assert.match(design.backgrounds.canvas, /48;2;30;30;46m/);
+	assert.equal(TSUKUYOMI_PALETTE.panelHover, "69;71;90");
+	assert.equal(TSUKUYOMI_PALETTE.band, "49;50;68");
+	assert.equal(TSUKUYOMI_PALETTE.borderMuted, "69;71;90");
+	assert.equal(TSUKUYOMI_PALETTE.border, "88;91;112");
+	assert.equal(TSUKUYOMI_PALETTE.tool, "36;39;58");
+	assert.equal(TSUKUYOMI_PALETTE.toolPending, "45;53;76");
 	assert.notEqual(TSUKUYOMI_PALETTE.thinkingLow, TSUKUYOMI_PALETTE.thinkingMedium);
-	assert.equal(TSUKUYOMI_PALETTE.syntaxKeyword, "0;180;255");
+	assert.equal(TSUKUYOMI_PALETTE.syntaxKeyword, "203;166;247");
 });
 
 test("shared rows expose consistent selected and status states", () => {

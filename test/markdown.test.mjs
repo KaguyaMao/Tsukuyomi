@@ -9,6 +9,7 @@ import {
 	langFromPath,
 	visibleLength,
 } from "../app/markdown.mjs";
+import { TSUKUYOMI_PALETTE } from "../app/design-system.mjs";
 
 const ESC = "\x1b[";
 const BOLD = `${ESC}1m`;
@@ -174,7 +175,7 @@ test("unfinished streaming fence still renders as a code block", () => {
 
 test("output blocks use semantic state surfaces", () => {
 	const rows = renderOutputBlock({ header: "Bash", state: "running", sections: [{ lines: ["echo ok"] }], width: 30 });
-	assert.match(rows.join("\n"), /48;2;24;38;55m/);
+	assert.ok(rows.join("\n").includes(`48;2;${TSUKUYOMI_PALETTE.toolPending}m`));
 	assert.equal(stripAnsi(rows[0]).startsWith("╭"), true);
 	assert.equal(stripAnsi(rows.at(-1)).startsWith("╰"), true);
 });
@@ -209,8 +210,8 @@ test("highlight decorates JavaScript keywords and strings", () => {
 	const stripped = stripAnsi(out);
 	assert.ok(stripped.includes("const"));
 	assert.ok(stripped.includes('"hi"'));
-	assert.match(out, /38;2;0;180;255m/, "OMP keyword color");
-	assert.match(out, /38;2;212;192;144m/, "OMP string color");
+	assert.ok(out.includes(`38;2;${TSUKUYOMI_PALETTE.syntaxKeyword}m`), "theme keyword color");
+	assert.ok(out.includes(`38;2;${TSUKUYOMI_PALETTE.syntaxString}m`), "theme string color");
 });
 
 test("highlight handles JSON keys versus strings", () => {
@@ -222,7 +223,7 @@ test("highlight handles JSON keys versus strings", () => {
 
 test("highlight falls back to plain text for unknown languages", () => {
 	const out = highlight("anything at all", "unknowndialect");
-	assert.equal(out, `${ESC}38;2;232;236;244manything at all`);
+	assert.equal(out, `${ESC}38;2;${TSUKUYOMI_PALETTE.text}manything at all`);
 });
 
 test("highlight covers python, bash and sql without throwing", () => {

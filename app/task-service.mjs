@@ -19,6 +19,15 @@ const exec = promisify(execFile);
 const hash = (text) => createHash("sha256").update(text).digest("hex");
 const git = async (cwd, args) => (await exec("git", args, { cwd, maxBuffer: 40 * 1024 * 1024 })).stdout;
 const textOf = (m) => (m?.content || []).filter((p) => p.type === "text").map((p) => p.text).join("\n");
+const toolHeading = (event) => {
+	const args = event.args || {};
+	const label = event.toolName === "bash" ? `$ ${args.command || ""}`
+		: event.toolName === "web_search" ? `Web Search: ${args.query || ""}`
+		: ["edit", "write"].includes(event.toolName) ? `Edit: ${args.path || args.file || ""}`
+		: ["read", "view"].includes(event.toolName) ? `Read: ${args.path || args.file || ""}`
+		: `${event.toolName || "Tool"}: ${args.path || args.query || args.action || ""}`;
+	return label.slice(0, 240);
+};
 export function subagentsEnabled(agentDir) {
 	for (const name of ["tsukuyomi-tools.json", "kaguya-tools.json"]) {
 		try {
@@ -66,7 +75,7 @@ export class TaskService {
 		this.policyTimer = setInterval(() => { if (!subagentsEnabled(this.agentDir)) this.cancelAgents(); }, 250); this.policyTimer.unref();
 		return { TSUKUYOMI_TASK_SOCKET: this.socketPath, TSUKUYOMI_TASK_TOKEN: this.token, TSUKUYOMI_TASK_CONTROLLER_TOKEN: this.controllerToken };
 	}
-	snapshot(job) { return { id: job.id, kind: job.kind, cwd: job.ownerCwd || job.cwd, toolCallId: job.toolCallId, command: job.command, status: job.status, output: redactText(job.output), result: redactText(job.result || ""), screen: redactText(job.screen || ""), exitCode: job.exitCode, readonly: job.readonly, profile: job.profile, role: job.params?.role, isolation: job.isolation, sharedWrite: job.sharedWrite, worktree: job.worktree, patchPath: job.patchPath, logPath: job.logPath, accountRef: job.params?.accountRef || job.params?.accountId, teamId: job.params?.teamId, memberId: job.params?.memberId, startedAt: job.startedAt, endedAt: job.endedAt }; }
+	snapshot(job) { return { id: job.id, kind: job.kind, cwd: job.ownerCwd || job.cwd, toolCallId: job.toolCallId, command: job.command, status: job.status, activity: job.activity || (job.status === "waiting" ? "waiting" : "working"), output: redactText(job.output), result: redactText(job.result || ""), screen: redactText(job.screen || ""), exitCode: job.exitCode, readonly: job.readonly, profile: job.profile, role: job.params?.role, isolation: job.isolation, sharedWrite: job.sharedWrite, worktree: job.worktree, patchPath: job.patchPath, logPath: job.logPath, accountRef: job.params?.accountRef || job.params?.accountId, teamId: job.params?.teamId, memberId: job.params?.memberId, startedAt: job.startedAt, endedAt: job.endedAt }; }
 	publish(job) {
 		if (job.timer) return;
 		job.timer = setTimeout(() => { job.timer = undefined; const event = `${JSON.stringify({ event: "job", job: this.snapshot(job) })}\n`; for (const socket of this.clients) if (socket.subscribed && socket.writable && socket.writableLength < 2_000_000) socket.write(event); }, 80);
@@ -86,7 +95,7 @@ export class TaskService {
 	}
 	create(params, kind) {
 		const id = randomUUID(), directory = join(this.agentDir, "jobs", id); mkdirSync(directory, { recursive: true, mode: 0o700 });
-		const job = { id, kind, cwd: realpathSync(params.cwd), toolCallId: params.toolCallId, command: params.command || params.task, status: "running", output: "", startedAt: Date.now(), directory, logPath: join(directory, "output.log"), params, capabilityToken: kind === "subagent" && params.teamId ? randomBytes(32).toString("hex") : undefined };
+		const job = { id, kind, cwd: realpathSync(params.cwd), toolCallId: params.toolCallId, command: params.command || params.task, status: "running", activity: "working", output: "", startedAt: Date.now(), directory, logPath: join(directory, "output.log"), params, capabilityToken: kind === "subagent" && params.teamId ? randomBytes(32).toString("hex") : undefined };
 		writeFileSync(job.logPath, "", { mode: 0o600 }); this.jobs.set(id, job); this.persist(job); return job;
 	}
 	persist(job) { writeFileSync(join(job.directory, "job.json"), `${JSON.stringify(this.snapshot(job), null, 2)}\n`, { mode: 0o600 }); }
@@ -153,7 +162,7 @@ export class TaskService {
 		}
 	}
 	async runAgent(job) {
-		job.status = "running"; const params = job.params;
+		job.status = "running"; job.activity = "thinking"; const params = job.params;
 		job.ownerCwd = job.cwd;
 		let gitRoot; try { gitRoot = (await git(job.cwd, ["rev-parse", "--show-toplevel"])).trim(); } catch {}
 		const mode = resolveWorkerPolicy({ gitRoot, profile: params.profile, isolation: params.isolation, readonly: params.readonly });
@@ -220,12 +229,24 @@ export class TaskService {
 			} : {}),
 		};
 		job.rpc = new PiRpc(this.piBin, args, childEnv, childCwd);
+		const toolOutput = new Map();
 		await new Promise((resolvePromise, reject) => {
 			job.rpc.onStderr((line) => this.output(job, `${line}\n`));
 			job.rpc.onExit(({ error }) => job.status === "cancelled" ? resolvePromise() : reject(error));
 		job.rpc.onEvent((event) => {
-				if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") this.output(job, event.assistantMessageEvent.delta);
-				if (event.type === "tool_execution_start") this.output(job, `\n[${event.toolName}] ${JSON.stringify(event.args)}\n`);
+				if (event.type === "message_update") {
+					if (event.assistantMessageEvent?.type === "thinking_delta") { job.activity = "thinking"; this.publish(job); }
+					if (event.assistantMessageEvent?.type === "text_delta") { job.activity = "working"; this.output(job, event.assistantMessageEvent.delta); }
+				}
+				if (event.type === "tool_execution_start") { job.activity = "working"; this.output(job, `\n▣ ${toolHeading(event)}\n`); }
+				if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+					const id = event.toolCallId || event.toolName;
+					const next = textOf(event.partialResult || event.result).slice(-16_000);
+					const previous = toolOutput.get(id) || "";
+					if (next && next !== previous) this.output(job, next.startsWith(previous) ? next.slice(previous.length) : `\n${next}`);
+					toolOutput.set(id, next);
+					if (event.type === "tool_execution_end") this.output(job, event.isError ? "\n✖ Tool failed\n" : "\n✓ Done\n");
+				}
 				if (event.type === "agent_settled") resolvePromise();
 			});
 			const executionNote = mode.readonly
@@ -248,6 +269,7 @@ export class TaskService {
 	}
 	async waitForSharedWriteLease(job) {
 		job.status = "waiting";
+		job.activity = "waiting";
 		this.publish(job);
 		while (!job.endedAt && !this.stopping) {
 			const lease = this.broker.request("team.lease.acquire", {
@@ -255,10 +277,13 @@ export class TaskService {
 			});
 			if (lease.acquired) {
 				job.status = "running";
+				job.activity = "working";
 				job.leaseTimer = setInterval(() => {
-					this.broker.request("team.lease.heartbeat", {
-						jobId: job.id, teamId: job.params.teamId, memberId: job.params.memberId, capabilityToken: job.capabilityToken,
-					}).catch(() => {});
+					try {
+						this.broker.request("team.lease.heartbeat", {
+							jobId: job.id, teamId: job.params.teamId, memberId: job.params.memberId, capabilityToken: job.capabilityToken,
+						});
+					} catch { /* The worker may have finished as the timer fired. */ }
 				}, 5_000);
 				job.leaseTimer.unref();
 				this.publish(job);

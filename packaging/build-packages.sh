@@ -40,7 +40,7 @@ if [[ -e "$OUTPUT/bundle-work" ]]; then
 		podman unshare rm -rf "$OUTPUT/bundle-work"
 	fi
 fi
-printf 'Creating complete Arch, RPM and Debian packages...\n'
+printf 'Creating bundled Linux packages...\n'
 BUNDLE_OUTPUT="$OUTPUT" \
 BUILDER_IMAGE="$PACKAGER_IMAGE" \
 NATIVE_BUILDER_IMAGE="$NATIVE_IMAGE" \

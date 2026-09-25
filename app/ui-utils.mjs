@@ -111,6 +111,23 @@ export function paintBackground(value, background) {
 	return `${background}${painted}\x1b[0m`;
 }
 
+/** Composite a modal over a fully surfaced row so its background cannot bleed
+ * into the unoccupied suffix when the terminal clips a trailing SGR reset. */
+export function compositeTuiOverlayLine(baseLine, overlayLine, {
+	startCol,
+	overlayWidth,
+	totalWidth,
+	background,
+	composite,
+}) {
+	const base = String(baseLine ?? "");
+	// pi-tui treats image rows atomically. Preserve that behavior by leaving
+	// Kitty and iTerm image escapes untouched before handing the row to it.
+	const imageRow = base.includes("\x1b_G") || base.includes("\x1b]1337;File=");
+	const surfaced = imageRow ? base : paintBackground(base, background);
+	return composite(surfaced, overlayLine, startCol, overlayWidth, totalWidth);
+}
+
 export function paintScreenRowClears(value, background) {
 	return String(value).replace(SCREEN_ROW_CLEAR, (_match, position) => `${position}${background}\x1b[2K`);
 }

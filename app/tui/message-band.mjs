@@ -21,8 +21,8 @@ export function renderUserMessageBand({
 	const timeText = timestamp != null ? ` ${formatTime(timestamp, locale)}` : "";
 	const timeWidth = visibleWidth(timeText);
 	const promptWidth = Math.max(1, bandWidth - prefixWidth - 1 - timeWidth);
-	const rows = [];
 	const { rows: lines, sgr } = textRows(owner, "band", prompt, promptWidth);
+	const rows = [];
 	for (let index = 0; index < lines.length; index++) {
 		let row = index > 0
 			? `${" ".repeat(prefixWidth + 1)}${sgr ? lines[index] : color.text(lines[index])}`
@@ -34,6 +34,6 @@ export function renderUserMessageBand({
 	}
 	const blank = bandBackground(" ".repeat(bandWidth));
 	const content = rows.length ? rows : [bandBackground(pad(`${prefix} `, bandWidth))];
-	// Preserve Grok Build's breathing room above and below even a one-line prompt.
+	// Keep Grok Build's breathing room above and below every user prompt.
 	return [blank, ...content, blank];
 }

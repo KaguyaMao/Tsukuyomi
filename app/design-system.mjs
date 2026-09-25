@@ -3,50 +3,48 @@
  *
  * Keep brand tokens here so the standalone TUI, Markdown renderer, dialogs and
  * future Agent/Team surfaces cannot slowly drift into different palettes.
- * Values intentionally mirror the established TUI palette; changing the
- * canvas/logo tokens is a breaking visual change.
+ * Catppuccin Mocha surfaces keep the composer, dialogs, tools and agent rail
+ * visually consistent; the Ti mark uses a separate yellow gradient.
  */
 
 export const TSUKUYOMI_PALETTE = Object.freeze({
-	canvas: "18;18;18",
-	// Keep the neutral canvas for Tsukuyomi's brand contract. The actual OMP
-	// Titanium surfaces and semantic colors below provide the visual language.
-	band: "24;28;36",
-	panel: "24;28;36",
-	panelHover: "0;130;179",
-	menu: "15;18;22",
-	menuSelection: "0;130;179",
-	selection: "0;130;179",
-	tool: "25;30;39",
-	toolPending: "24;38;55",
-	toolSuccess: "22;47;35",
-	toolError: "50;23;29",
-	text: "232;236;244",
-	muted: "174;182;196",
-	dim: "134;144;160",
-	accent: "0;180;255",
-	secondary: "0;180;255",
-	brand: "212;192;144",
-	success: "0;255;136",
-	warning: "255;179;71",
-	error: "255;71;87",
-	border: "112;122;138",
-	borderMuted: "78;88;104",
-	thinkingMinimal: "134;144;160",
-	thinkingLow: "0;130;179",
-	thinkingMedium: "0;180;255",
-	thinkingHigh: "212;192;144",
-	thinkingXhigh: "255;179;71",
-	thinkingMax: "255;71;87",
-	syntaxComment: "107;114;128",
-	syntaxKeyword: "0;180;255",
-	syntaxFunction: "0;255;136",
-	syntaxVariable: "232;236;244",
-	syntaxString: "212;192;144",
-	syntaxNumber: "255;179;71",
-	syntaxType: "0;180;255",
-	syntaxOperator: "0;180;255",
-	syntaxPunctuation: "156;163;176",
+	canvas: "30;30;46",       // Catppuccin Mocha base
+	band: "49;50;68",         // surface0
+	panel: "36;39;58",        // mantle lifted for panels
+	panelHover: "69;71;90",   // surface1
+	menu: "24;24;37",         // mantle
+	menuSelection: "69;71;90",
+	selection: "69;71;90",
+	tool: "36;39;58",
+	toolPending: "45;53;76",
+	toolSuccess: "39;59;53",
+	toolError: "74;42;57",
+	text: "205;214;244",      // text
+	muted: "166;173;200",     // subtext0
+	dim: "127;132;156",       // overlay1
+	accent: "137;180;250",    // blue
+	secondary: "148;226;213", // teal
+	brand: "249;226;175",     // yellow
+	success: "166;227;161",
+	warning: "250;179;135",
+	error: "243;139;168",
+	border: "88;91;112",
+	borderMuted: "69;71;90",
+	thinkingMinimal: "127;132;156",
+	thinkingLow: "137;180;250",
+	thinkingMedium: "148;226;213",
+	thinkingHigh: "249;226;175",
+	thinkingXhigh: "250;179;135",
+	thinkingMax: "243;139;168",
+	syntaxComment: "127;132;156",
+	syntaxKeyword: "203;166;247",
+	syntaxFunction: "137;180;250",
+	syntaxVariable: "205;214;244",
+	syntaxString: "166;227;161",
+	syntaxNumber: "250;179;135",
+	syntaxType: "249;226;175",
+	syntaxOperator: "137;180;250",
+	syntaxPunctuation: "166;173;200",
 });
 
 const ESC = "\x1b[";

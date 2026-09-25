@@ -114,7 +114,7 @@ Skill 由 Tsukuyomi 独立发现和保存启用状态。启动 PI RPC 内核时�
 
 ## 安装
 
-npm 包需要 Node.js 20 或更新。**PI 内核已作为依赖随包安装**（`@earendil-works/pi-coding-agent` 及 `pi-agent-core`/`pi-ai`），Tsukuyomi 通过 Node 自身的模块解析使用自己钉扎的那一份，因此无需再单独全局安装 `pi`；`TSUKUYOMI_PI` 仍可覆盖为一个外部 `pi`。x86_64 RPM、Arch 和 Debian 包是完整的快照，自带私有 Node.js/npm runtime，PI runtime 和 production dependencies 钉扎；它们不替换系统的 `node`、`npm` 或 `pi`。Tsukuyomi 默认使用直接 Node pipes；只有显式配置 `TSUKUYOMI_SOCAT`（或兼容的 `KAGUYAPI_SOCAT`）时才使用 PTY RPC 传输，以兼容包含非 ASCII 字符的安装路径。
+npm 包需要 Node.js 22.5.0 或更新版本（PI 内核使用 `node:fs.globSync`）。**PI 内核已作为依赖随包安装**（`@earendil-works/pi-coding-agent` 及 `pi-agent-core`/`pi-ai`），Tsukuyomi 通过 Node 自身的模块解析使用自己钉扎的那一份，因此无需再单独全局安装 `pi`；`TSUKUYOMI_PI` 仍可覆盖为一个外部 `pi`。x86_64 RPM、Arch 和 Debian 包是完整的快照，自带私有 Node.js/npm runtime、PI runtime 和 production dependencies；它们不替换系统的 `node`、`npm` 或 `pi`。Tsukuyomi 默认使用直接 Node pipes；只有显式配置 `TSUKUYOMI_SOCAT`（或兼容的 `KAGUYAPI_SOCAT`）时才使用 PTY RPC 传输，以兼容包含非 ASCII 字符的安装路径。
 
 ## 自动更新
 
@@ -125,22 +125,22 @@ npm 包需要 Node.js 20 或更新。**PI 内核已作为依赖随包安装**（
 - RPM、Arch 和 Debian 安装包不是 Git 检出目录，因此不会绕过系统包管理器自更新。
 - 设置 `TSUKUYOMI_UPDATE_CHECK=0` 可关闭启动检查；运行 `/update` 可在 TUI 中手动检查。
 
-**从 npm 全局安装**：
+**从构建出的 npm 包全局安装**：
 
 ```bash
-npm install --global --ignore-scripts tsukuyomi
+npm install --global ./dist/packages/tsukuyomi-0.6.2.tgz
 tsukuyomi
 ```
 
 **在 Windows 上安装（PowerShell / Windows Terminal）**：
 
-1. 安装 Node.js 20 或更新版本（<https://nodejs.org> 的 LTS 安装包，或 `winget install OpenJS.NodeJS.LTS`）。
+1. 安装 Node.js 22.5.0 或更新版本（<https://nodejs.org> 的 LTS 安装包，或 `winget install OpenJS.NodeJS.LTS`）。
 2. 安装 Tsukuyomi（内核随依赖一起安装，无需单独装 `pi`）：
 
    ```powershell
-   npm install -g --ignore-scripts .\tsukuyomi-0.6.0.tgz
+   npm.cmd install -g .\dist\packages\tsukuyomi-0.6.2.tgz
    # 或者，在源码目录中：
-   # npm install -g --ignore-scripts .
+   # npm.cmd install -g .
    ```
 
 3. 运行：
@@ -166,21 +166,21 @@ tsukuyomi
 **使用 DNF 安装本地 RPM**：
 
 ```bash
-sudo dnf install ./tsukuyomi-0.5.0-1.x86_64.rpm
+sudo dnf install ./dist/packages/tsukuyomi-0.6.2-1.x86_64.rpm
 tsukuyomi
 ```
 
 **使用 pacman 安装本地 Arch 包**：
 
 ```bash
-sudo pacman -U ./tsukuyomi-0.5.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./dist/packages/tsukuyomi-0.6.2-1-x86_64.pkg.tar.zst
 tsukuyomi
 ```
 
 **使用 APT 安装本地 Debian/Ubuntu 包**：
 
 ```bash
-sudo apt install ./tsukuyomi_0.5.0-1_amd64.deb
+sudo apt install ./dist/packages/tsukuyomi_0.6.2-1_amd64.deb
 tsukuyomi
 ```
 

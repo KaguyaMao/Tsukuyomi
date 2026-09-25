@@ -10,7 +10,7 @@ for (const columns of [40, 60, 80, 120, 160]) {
 		const geometry = wideComposerGeometry(columns, 5);
 		assert.equal(geometry.minimal, columns < 8);
 		assert.equal(geometry.columns, columns);
-		assert.equal(geometry.contentWidth, Math.max(1, columns - 6));
+		assert.equal(geometry.contentWidth, Math.max(1, columns - 4));
 		assert.equal(geometry.statusAvailable, Math.max(0, columns - 6));
 	});
 }
@@ -21,7 +21,7 @@ test("tiny composer geometry keeps the existing one-row fallback", () => {
 	assert.equal(wideComposerGeometry(80, 2).minimal, false);
 });
 
-test("user prompt background covers the conversation width, not text length", () => {
+test("user prompt band retains breathing rows above and below the message", () => {
 	const painted = [];
 	const color = { text: (value) => value };
 	const rows = renderUserMessageBand({
@@ -40,7 +40,9 @@ test("user prompt background covers the conversation width, not text length", ()
 	assert.deepEqual(rows.map((row) => stripAnsi(row).length), [118, 118, 118]);
 	assert.ok(painted.length >= 2);
 	assert.ok(painted.every((rowWidth) => rowWidth === 118));
-	assert.equal(rows.length, 3, "single-line prompt keeps its top and bottom breathing rows");
+	assert.match(rows[1], /❯ short/);
+	assert.equal(stripAnsi(rows[0]).trim(), "");
+	assert.equal(stripAnsi(rows[2]).trim(), "");
 });
 
 test("user prompt band remains full-width with timestamps and empty text", () => {

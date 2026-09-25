@@ -216,5 +216,6 @@ export function syncAllToModelsJson(agentDir) {
 	if (loaded.error) throw authError(AuthErrorCode.CONFIG, loaded.error);
 	const next = { ...(loaded.config.providers || {}) };
 	for (const cfg of providers) next[cfg.id] = toPiModelsProvider(cfg);
+	if (JSON.stringify(next) === JSON.stringify(loaded.config.providers || {})) return loaded.config;
 	return replaceModelsProviders(agentDir, next);
 }
